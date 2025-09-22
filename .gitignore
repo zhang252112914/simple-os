@@ -3,4 +3,5 @@ CLAUDE.md
 *.d
 *.asm
 *.sym
+compile_commands.json
 .cache/

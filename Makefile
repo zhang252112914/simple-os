@@ -5,7 +5,10 @@ OBJS = \
   kernel/entry.o \
   kernel/start.o \
   kernel/uart.o \
-  kernel/main.o
+  kernel/console.o \
+  kernel/printf.o \
+  kernel/main.o \
+  tests/print_test.o
 
 # Try to infer the correct TOOLPREFIX if not set
 ifndef TOOLPREFIX
@@ -77,7 +80,7 @@ tags: $(OBJS)
 
 # Clean build artifacts
 clean: 
-	rm -f kernel/*.o kernel/*.d kernel/*.asm kernel/*.sym \
+	rm -f kernel/*.o kernel/*.d kernel/*.asm kernel/*.sym tests/*.o tests/*.d tests/*.asm tests/*.sym \
 	kernel/kernel .gdbinit tags
 
 # QEMU configuration

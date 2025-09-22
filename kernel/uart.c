@@ -59,10 +59,10 @@ void uartinit(void) {
   WriteReg(IER, IER_TX_ENABLE | IER_RX_ENABLE);
 }
 
-void uart_putc(char c) { WriteReg(THR, c); }
+void uartputc(char c) { WriteReg(THR, c); }
 
-void uart_puts(char *s) {
+void uartputs(char *s) {
   while (*s) {
-    uart_putc(*s++);
+    uartputc(*s++);
   }
 }
