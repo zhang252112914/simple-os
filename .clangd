@@ -1,0 +1,8 @@
+---
+CompileFlags:
+  Add: [-include, kernel/types.h]
+---
+If:
+  PathMatch: kernel/defs\.h$
+CompileFlags:
+  Add: [-include, kernel/riscv.h]

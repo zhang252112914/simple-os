@@ -1,0 +1,6 @@
+CLAUDE.md
+*.o
+*.d
+*.asm
+*.sym
+.cache/
