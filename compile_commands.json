@@ -21,9 +21,9 @@
       "kernel/entry.o",
       "kernel/entry.S"
     ],
-    "directory": "/home/zyl/os/riscv-os",
-    "file": "/home/zyl/os/riscv-os/kernel/entry.S",
-    "output": "/home/zyl/os/riscv-os/kernel/entry.o"
+    "directory": "/home/zyl/os/simple-os",
+    "file": "/home/zyl/os/simple-os/kernel/entry.S",
+    "output": "/home/zyl/os/simple-os/kernel/entry.o"
   },
   {
     "arguments": [
@@ -47,9 +47,9 @@
       "kernel/start.o",
       "kernel/start.c"
     ],
-    "directory": "/home/zyl/os/riscv-os",
-    "file": "/home/zyl/os/riscv-os/kernel/start.c",
-    "output": "/home/zyl/os/riscv-os/kernel/start.o"
+    "directory": "/home/zyl/os/simple-os",
+    "file": "/home/zyl/os/simple-os/kernel/start.c",
+    "output": "/home/zyl/os/simple-os/kernel/start.o"
   },
   {
     "arguments": [
@@ -73,9 +73,9 @@
       "kernel/uart.o",
       "kernel/uart.c"
     ],
-    "directory": "/home/zyl/os/riscv-os",
-    "file": "/home/zyl/os/riscv-os/kernel/uart.c",
-    "output": "/home/zyl/os/riscv-os/kernel/uart.o"
+    "directory": "/home/zyl/os/simple-os",
+    "file": "/home/zyl/os/simple-os/kernel/uart.c",
+    "output": "/home/zyl/os/simple-os/kernel/uart.o"
   },
   {
     "arguments": [
@@ -99,9 +99,9 @@
       "kernel/console.o",
       "kernel/console.c"
     ],
-    "directory": "/home/zyl/os/riscv-os",
-    "file": "/home/zyl/os/riscv-os/kernel/console.c",
-    "output": "/home/zyl/os/riscv-os/kernel/console.o"
+    "directory": "/home/zyl/os/simple-os",
+    "file": "/home/zyl/os/simple-os/kernel/console.c",
+    "output": "/home/zyl/os/simple-os/kernel/console.o"
   },
   {
     "arguments": [
@@ -125,9 +125,9 @@
       "kernel/printf.o",
       "kernel/printf.c"
     ],
-    "directory": "/home/zyl/os/riscv-os",
-    "file": "/home/zyl/os/riscv-os/kernel/printf.c",
-    "output": "/home/zyl/os/riscv-os/kernel/printf.o"
+    "directory": "/home/zyl/os/simple-os",
+    "file": "/home/zyl/os/simple-os/kernel/printf.c",
+    "output": "/home/zyl/os/simple-os/kernel/printf.o"
   },
   {
     "arguments": [
@@ -151,8 +151,34 @@
       "kernel/main.o",
       "kernel/main.c"
     ],
-    "directory": "/home/zyl/os/riscv-os",
-    "file": "/home/zyl/os/riscv-os/kernel/main.c",
-    "output": "/home/zyl/os/riscv-os/kernel/main.o"
+    "directory": "/home/zyl/os/simple-os",
+    "file": "/home/zyl/os/simple-os/kernel/main.c",
+    "output": "/home/zyl/os/simple-os/kernel/main.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/riscv64-unknown-elf-gcc",
+      "-Wall",
+      "-Werror",
+      "-O",
+      "-fno-omit-frame-pointer",
+      "-ggdb",
+      "-gdwarf-2",
+      "-mcmodel=medany",
+      "-ffreestanding",
+      "-fno-common",
+      "-fno-builtin",
+      "-Wno-main",
+      "-I.",
+      "-fno-stack-protector",
+      "-fno-pie",
+      "-c",
+      "-o",
+      "tests/print_test.o",
+      "tests/print_test.c"
+    ],
+    "directory": "/home/zyl/os/simple-os",
+    "file": "/home/zyl/os/simple-os/tests/print_test.c",
+    "output": "/home/zyl/os/simple-os/tests/print_test.o"
   }
 ]
