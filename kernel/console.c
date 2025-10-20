@@ -11,6 +11,10 @@
 
 #include <stdarg.h>
 
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
 #include "defs.h"
 
 #define BACKSPACE 0x100
@@ -31,5 +35,8 @@ void consputc(int c) {
     uartputc(c);
   }
 }
+
+// Clear screen function using ANSI escape sequences
+void clear_screen(void) { printf("\033[2J\033[H"); }
 
 void consoleinit(void) { uartinit(); }

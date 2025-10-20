@@ -1,375 +1,49 @@
-# 实验2：内核printf与清屏功能实现
-
-## 1. 系统设计部分
-
-### 1.1 架构设计说明
-
-#### xv6输出系统架构分析
-
-xv6的输出系统采用了经典的分层设计架构，从上到下分为四个层次：
-
-```
-应用层: printf() 格式化输出
-  ↓
-抽象层: consputc() 控制台抽象
-  ↓
-驱动层: uartputc() UART硬件驱动
-  ↓
-硬件层: UART寄存器操作
-```
-
-**分层职责划分：**
-
-1. **格式化层** (printf.c)
-   - 解析格式化字符串
-   - 处理可变参数
-   - 数字转字符串转换
-
-2. **控制台抽象层** (console.c)
-   - 提供设备无关的输出接口
-   - 处理特殊字符（如退格）
-   - 为多设备支持提供抽象
-
-3. **硬件驱动层** (uart.c)
-   - 直接操作UART硬件寄存器
-   - 提供字符和字符串输出接口
-   - 处理硬件初始化配置
-
-#### 本实现的架构设计
-
-基于xv6的设计，我们采用相似的分层架构：
-
-````c
-// 硬件层接口
-void uart_putc(char c);
-void uart_puts(char *s);
-
-// 控制台层接口
-void console_putc(char c);
-void console_puts(const char *s);
-void clear_screen(void);
-
-// 格式化层接口
-int printf(const char *fmt, ...);
-void printint(long long xx, int base, int sign);
-void printptr(uint64 x);
-````
-
-### 1.2 关键数据结构
-
-#### 输出缓冲区结构
-````c
-// 可选的缓冲机制
-struct output_buffer {
-    char data[256];
-    int pos;
-    int size;
-};
-````
-
-#### 格式化状态结构
-````c
-// 格式解析状态
-struct format_state {
-    int in_format;      // 是否在格式符内
-    int width;          // 字段宽度
-    int precision;      // 精度
-    char specifier;     // 格式说明符
-};
-````
-
-### 1.3 与xv6对比分析
-
-**相同点：**
-- 采用分层架构设计
-- 硬件抽象层隔离
-- 格式化字符串解析方式
-- 数字转换算法思路
-
-**不同点：**
-- 增强错误处理机制
-- 扩展清屏功能支持
-- 优化性能考虑
-- 更丰富的格式化选项
-
-**设计优势：**
-1. **模块化**：各层职责清晰，便于维护和测试
-2. **可扩展性**：易于添加新的输出设备和格式
-3. **可移植性**：上层代码与硬件平台无关
-4. **可调试性**：分层设计便于定位问题
-
-### 1.4 设计决策理由
-
-#### 为什么需要分层？
-- **关注点分离**：每层处理特定的功能
-- **代码复用**：底层接口可被多个上层使用
-- **易于测试**：各层可独立进行单元测试
-- **维护性**：修改某层不影响其他层
-
-#### 缓冲机制考虑
-- **性能提升**：减少系统调用次数
-- **原子性**：保证输出的完整性
-- **内存权衡**：需要平衡内存使用和性能
-
-## 2. 实现过程部分
-
-### 2.1 实现步骤记录
-
-#### 步骤1：分析xv6核心函数
-
-**printf()函数解析：**
-````c
-int printf(const char *fmt, ...) {
-  va_list ap;
-  int i, cx, c0, c1, c2, locking;
-  char *s;
-
-  locking = pr.locking;
-  if(locking)
-    acquire(&pr.lock);
-
-  if (fmt == 0)
-    panic("null fmt");
-
-  va_start(ap, fmt);
-  for(i = 0; (c0 = fmt[i] & 0xff) != 0; i++){
-    if(c0 != '%'){
-      consputc(c0);
-      continue;
-    }
-    c1 = fmt[i+1] & 0xff;
-    if(c1 == 0)
-      break;
-    // 格式符处理...
-  }
-  va_end(ap);
-
-  if(locking)
-    release(&pr.lock);
-
-  return 0;
-}
-````
-
-#### 步骤2：数字转换算法实现
-
-**printint()核心算法：**
-````c
-static void printint(long long xx, int base, int sign) {
-  char buf[20];
-  int i;
-  unsigned long long x;
-
-  if(sign && (sign = (xx < 0)))
-    x = -xx;
-  else
-    x = xx;
-
-  i = 0;
-  do {
-    buf[i++] = digits[x % base];
-  } while((x /= base) != 0);
-
-  if(sign)
-    buf[i++] = '-';
-
-  while(--i >= 0)
-    consputc(buf[i]);
-}
-````
-
-**算法亮点：**
-- 使用字符数组逆序存储，避免递归
-- 将负数转为正数处理，避免INT_MIN溢出
-- 支持不同进制（10进制、16进制）
-
-#### 步骤3：格式字符串解析
-
-实现了对以下格式的支持：
-- `%d`, `%ld`, `%lld` - 有符号整数
-- `%u`, `%lu`, `%llu` - 无符号整数  
-- `%x`, `%lx`, `%llx` - 十六进制
-- `%p` - 指针
-- `%c` - 字符
-- `%s` - 字符串
-- `%%` - 百分号转义
-
-#### 步骤4：清屏功能实现
-
-````c
-void clear_screen(void) {
-    // 清除整个屏幕
-    printf("\033[2J");
-    // 光标回到左上角
-    printf("\033[H");
-}
-
-void goto_xy(int x, int y) {
-    printf("\033[%d;%dH", y, x);
-}
-
-void clear_line(void) {
-    printf("\033[K");
-}
-````
-
-### 2.2 问题与解决方案
-
-#### 问题1：INT_MIN处理
-**问题描述：** INT_MIN的绝对值超出int范围，直接取负会溢出
-
-**解决方案：**
-````c
-// 使用unsigned long long避免溢出
-if(sign && (sign = (xx < 0)))
-  x = -xx;  // 安全转换到unsigned类型
-````
-
-#### 问题2：NULL指针处理
-**问题描述：** 传入NULL字符串指针可能导致系统崩溃
-
-**解决方案：**
-````c
-if((s = va_arg(ap, char*)) == 0)
-  s = "(null)";  // 提供默认显示
-````
-
-#### 问题3：递归vs迭代选择
-**问题描述：** 数字转字符串可用递归或迭代实现
-
-**解决方案：** 选择迭代方式
-- 内核栈空间有限
-- 避免深度递归导致栈溢出
-- 性能更好，内存使用可控
-
-### 2.3 源码理解总结
-
-#### 核心设计原则
-1. **安全第一**：处理所有边界情况
-2. **性能考虑**：避免不必要的递归和内存分配
-3. **代码简洁**：逻辑清晰，易于理解
-4. **功能完整**：支持常用的所有格式
-
-
-## 3. 测试验证部分
-
-### 3.1 功能测试结果
-
-#### 基本功能测试
-````c
-    printf("Testing ID output...\n");
-    long long id = 2023302111177;
-    printf("Test ID: %lld\n", id);
-    test_assert(id == 2023302111177, "id_output_correct");
-````
-
-**测试结果：** ✅ 所有基本格式都能正确输出
-
-#### 边界情况测试
-````c
-void test_printf_edge_cases() {
-    printf("=== 边界情况测试 ===\n");
-    printf("INT_MAX: %d\n", 2147483647);
-    printf("INT_MIN: %d\n", -2147483648);
-    printf("LONG_MAX: %ld\n", 9223372036854775807LL);
-    printf("空字符串: %s\n", "");
-    printf("大十六进制: 0x%llx\n", 0xDEADBEEFCAFEBABELL);
-}
-````
-
-**测试结果：** ✅ 边界情况处理正确，未出现崩溃
-
-#### 清屏功能测试
-````c
-void test_clear_functions() {
-    printf("清屏前的内容...\n");
-    printf("第二行内容\n");
-    printf("第三行内容\n");
-    
-    // 等待一段时间
-    for(int i = 0; i < 1000000; i++);
-    
-    clear_screen();
-    printf("清屏后的内容\n");
-    
-    goto_xy(10, 5);
-    printf("定位输出测试");
-}
-````
-
-**测试结果：** ✅ 清屏和光标定位功能正常工作
-
-#### 内存使用分析
-- printf函数栈空间使用：约100字节
-- 数字转换缓冲区：20字节
-- 总内存开销：小于1KB
-
-
-### 3.2 运行截图/录屏
-
-#### 启动输出
-![测试截图1](./lab2_1.png)
-```
-Hello, os
-My ID is 2023302111177
-
-=== Output Tests ===
-Testing basic printf...
-PASS: printf_basic_output
-Testing format specifiers...
-Integer: 42, Hex: 2a
-PASS: printf_format_specifiers
-Testing ID output...
-Test ID: 2023302111177
-PASS: id_output_correct
-=== 边界情况测试 ===
-INT_MAX: 2147483647
-INT_MIN: -2147483648
-LONG_MAX: 9223372036854775807
-空字符串: 
-大十六进制: 0xdeadbeefcafebabe
-
-Test Results: 3/3 passed
-```
-
-#### 清屏演示
-![测试截图2](./lab2_2.png)
-```
-此时qemu将清空终端（所有历史保存，但是会移动到屏幕外）
-```
-
-**测试总结：**
-- ✅ 所有基本功能正常工作
-- ✅ 边界情况处理正确
-- ✅ 错误恢复机制有效
-- ✅ 性能满足要求
-- ✅ 内存使用合理
-
-## 4. 实验总结
-
-### 4.1 技术收获
-
-1. **深度理解了操作系统输出架构**
-   - 分层设计的重要性和实现方式
-   - 硬件抽象层的作用和设计原则
-   - 驱动程序的基本结构
-
-2. **掌握了系统级编程技巧**
-   - 可变参数函数的实现
-   - 数字转字符串的高效算法
-   - 状态机式字符串解析
-   - 内存安全编程实践
-
-3. **学会了系统调试方法**
-   - 分层调试策略
-   - 边界条件测试设计
-   - 性能分析方法
-
-### 4.2 设计思想体会
-
-通过本次实验，深刻理解了以下设计思想：
-
-1. **分层抽象**：每一层都有明确的职责，上层不需要了解下层的实现细节
-2. **错误处理**：系统级代码必须考虑所有可能的异常情况
-3. **性能优化**：在保证正确性的前提下，优化算法和数据结构
-4. **可维护性**：良好的代码结构使得功能扩展和bug修复变得容易
+## 设计1：内存布局
+### 物理内存
+- 低地址空间：设备寄存器（如 UART、VIRTIO、PLIC、CLINT 等）通常位于固定物理地址区间。
+- 内核镜像（kernel binary）：linker 将内核放在物理内存0x80000000开始的空间中。
+- 物理页分配区：kalloc 从内核镜像 end 之后到 PHYSTOP 的物理内存中分配空闲页（kalloc.c 管理）。
+- PHYSTOP：物理内存上限，内核不会使用高于该物理地址的物理内存（memlayout.h 中定义）。
+
+### 虚拟内存
+整体是一个三级页表，每级512个条目，页大小：PGSIZE = 4096 字节。每个 PTE 是 64 位：高位存放物理页号(PPN)，低位若干位为标志位（PTE_V, PTE_R, PTE_W, PTE_X, PTE_U 等），实现里用宏 PA2PTE/PTE2PA、PTE_FLAGS 操作这些位。
+[63:39] 符号扩展（MAXVA 限制）
+[38:30] VPN[2]（level2 索引）
+[29:21] VPN[1]（level1 索引）
+[20:12] VPN[0]（level0 索引）
+[11:0] 页内偏移
+
+### 特殊：内核空间
+由于内核空间实际上是直接映射，所以可以直接看作 VA = PA
+
+## 设计2：内存管理
+### 物理内存管理
+#### 组织
+物理内存按照页大小被分为物理页，所有物理页构成一个空闲链表
+#### 分配与释放
+kalloc从链表中拿出第一个空闲页面并用memset填充垃圾字节，kfree一方面做对齐检查，不小于end且小于PHYSTOP，同时把页面清1并放回链表
+
+### 虚拟内存管理
+#### 查找
+- walk：给定 pagetable 与虚地址 va，逐层读取 PTE；若需要且 alloc 非 0，会用 kalloc 分配新的页表页并在上层 PTE 中安装（置 PTE_V）。返回指向第 0 级的 PTE 的指针（叶 PTE）。
+- walkaddr：仅用于用户地址，查找 va 映射到的物理地址（页对齐偏移保留），并验证该 PTE 对用户可读，最终返回对应的物理地址。
+#### 分配
+##### 基础操作
+- mappages：为从 va 开始长度为 size（必须页对齐）的虚地址区间逐页建立到从 pa 开始的物理页的映射，权限由 perm 指定。0 成功，-1 如果 walk() 在需要时无法分配页表页。
+- pagetable_t uvmcreate：分配并返回一个新页表的虚拟地址，若 kalloc 返回 0，则返回 0。
+##### 分配
+- uvmalloc：把进程从 oldsz 增大到 newsz（不小于 oldsz），为新增空间分配物理页并映射到用户页表。将 oldsz 向上取整为页边界，从 oldsz 到 newsz 每页调用 kalloc()、清零、mappages(..., PTE_R|PTE_U|xperm)；若 kalloc 或 mappages 失败，调用 uvmdealloc 回滚并返回 0。
+#### 释放
+##### 基础操作
+- uvmunmap：对每页调用 walk(..., alloc=0) 获取 PTE（若 PTE 页表页不存在则跳过）；若 PTE_V 清零并在 do_free 时调用 kfree 释放物理页（通过 PTE2PA 获取物理地址）。
+- uvmdealloc：缩减进程地址空间大小，从 oldsz 减到 newsz；释放多余页面及其映射。
+##### 大规模释放
+- freewalk：递归释放一个页表及其所有下层页表页（前提是所有叶映射已被移除）。
+- uvmfree：先释放从 0 到 sz 的所有用户页面（如果 sz>0），然后释放页表结构本身（调用 freewalk）。
+#### 复制
+- uv吗copy：在 fork 时把父进程 old 的前 sz 字节内存复制到子进程 new：为每个已映射页分配新物理页并复制数据，然后在子页表上映射新页。
+
+## 设计3：初始化
+- kinit：初始化物理内存，调用freerange初始化所有物理内存的初始状态。
+- kvminit：创建初始的内核页表，一方面是构建内核页表，另一方面是完成了初始的一些映射（按照memlayout.h）。
+- kvminithart：设置指向页表的指针，以此转向虚拟内存的工作模式。

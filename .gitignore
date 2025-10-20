@@ -3,5 +3,6 @@ CLAUDE.md
 *.d
 *.asm
 *.sym
+kernel/kernel
+.gdbinit
 compile_commands.json
-.cache/

@@ -6,3 +6,8 @@ If:
   PathMatch: kernel/defs\.h$
 CompileFlags:
   Add: [-include, kernel/riscv.h]
+---
+If:
+  PathMatch: kernel/sleeplock\.h$
+CompileFlags:
+  Add: [-include, kernel/spinlock.h]

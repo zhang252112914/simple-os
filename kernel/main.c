@@ -1,19 +1,19 @@
 #include "types.h"
-#include "defs.h"
+#include "param.h"
+#include "memlayout.h"
 #include "riscv.h"
-#include "../tests/print_test.h"
+#include "defs.h"
 
 // start() jumps here in supervisor mode on all CPUs.
 void main() {
   consoleinit();
   printfinit();
-  printf("Hello, os\n");
-  long long id = 2023302111177;
-  printf("My ID is %lld\n", id);
-
-  run_output_tests();
-
-  clean_tests();
-
+  printf("\n");
+  printf("kernel is booting\n");
+  printf("\n");
+  kinit();       // physical page allocator
+  kvminit();     // create kernel page table
+  kvminithart(); // turn on paging
+  kerneltest();  // run kernel tests
   panic("main");
 }
