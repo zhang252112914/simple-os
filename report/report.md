@@ -1,9 +1,4 @@
 # 实验报告：中断处理与时钟管理分析
-
-## 概述
-
-本实验聚焦操作系统内核中的中断（interrupt）与异常/陷入（trap）处理，以及时钟（定时器）中断如何触发、处理并与调度（上下文切换）协作。分析基于仓库中的核心源码文件：kernelvec.S、trampoline.S、trap.c、trap.h、plic.c、uart.c、start.c、kernel.ld、vm.c 等。
-
 ## 一、中断/异常处理的总体架构
 
 ### 运行特权级别
