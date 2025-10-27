@@ -7,6 +7,7 @@
 #include "memlayout.h"
 // #include "spinlock.h"
 #include "riscv.h"
+#include "trap.h"
 #include "defs.h"
 
 void freerange(void *pa_start, void *pa_end);

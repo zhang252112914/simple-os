@@ -5,9 +5,9 @@ CompileFlags:
 If:
   PathMatch: kernel/defs\.h$
 CompileFlags:
-  Add: [-include, kernel/riscv.h]
+  Add: [-include, kernel/riscv.h, -include, kernel/trap.h]
 ---
 If:
-  PathMatch: kernel/sleeplock\.h$
+  PathMatch: kernel/trap\.h$
 CompileFlags:
-  Add: [-include, kernel/spinlock.h]
+  Add: [-include, kernel/param.h]

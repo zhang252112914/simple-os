@@ -8,6 +8,12 @@ void *kalloc(void);
 void kfree(void *);
 void kinit(void);
 
+// plic.c
+void plicinit(void);
+void plicinithart(void);
+int plic_claim(void);
+void plic_complete(int);
+
 // printf.c
 int printf(char *, ...) __attribute__((format(printf, 1, 2)));
 void panic(char *) __attribute__((noreturn));
@@ -22,10 +28,30 @@ int strlen(const char *);
 int strncmp(const char *, const char *, uint);
 char *strncpy(char *, const char *, int);
 
+// trap.c
+extern uint ticks;
+void trapinit(void);
+void trapinithart(void);
+void handle_exception(struct trapframe *);
+int register_interrupt(int, interrupt_handler_t, void *, char *);
+void unregister_interrupt(int, interrupt_handler_t, void *);
+void enable_interrupt(int);
+void disable_interrupt(int);
+void set_irq_priority(int, int);
+int get_irq_priority(int);
+void enter_interrupt(void);
+void exit_interrupt(void);
+int in_interrupt(void);
+int interrupt_depth(void);
+void print_irq_stats(void);
+uint64 get_irq_count(int);
+
 // uart.c
 void uartinit(void);
-void uartputc(char);
-void uartputs(char *);
+int uartintr(void *);
+void uartwrite(char[], int);
+void uartputc_sync(int);
+int uartgetc(void);
 
 // vm.c
 void kvminit(void);

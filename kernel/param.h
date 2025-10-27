@@ -11,3 +11,6 @@
 #define FSSIZE 2000                 // size of file system in blocks
 #define MAXPATH 128                 // maximum file path name
 #define USERSTACK 1                 // user stack pages
+#define MAX_IRQS 64                 // maximum number of IRQs
+#define MAX_HANDLERS_PER_IRQ 4      // maximum handlers for each IRQ
+#define MAX_INTERRUPT_DEPTH 3       // maximum nested interrupt depth

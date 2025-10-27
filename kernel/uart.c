@@ -6,6 +6,7 @@
 #include "param.h"
 #include "memlayout.h"
 #include "riscv.h"
+#include "trap.h"
 #include "defs.h"
 
 // the UART control registers are memory-mapped
@@ -36,6 +37,14 @@
 #define ReadReg(reg) (*(Reg(reg)))
 #define WriteReg(reg, v) (*(Reg(reg)) = (v))
 
+// for transmission.
+// static struct spinlock tx_lock;
+static int tx_busy; // is the UART busy sending?
+// static int tx_chan; // &tx_chan is the "wait channel"
+
+extern volatile int panicking; // from printf.c
+extern volatile int panicked;  // from printf.c
+
 void uartinit(void) {
   // disable interrupts.
   WriteReg(IER, 0x00);
@@ -58,12 +67,88 @@ void uartinit(void) {
 
   // enable transmit and receive interrupts.
   WriteReg(IER, IER_TX_ENABLE | IER_RX_ENABLE);
+
+  // initlock(&tx_lock, "uart");
+
+  register_interrupt(UART0_IRQ, uartintr, 0, "uart");
 }
 
-void uartputc(char c) { WriteReg(THR, c); }
+// transmit buf[] to the uart. it blocks if the
+// uart is busy, so it cannot be called from
+// interrupts, only from write() system calls.
+void uartwrite(char buf[], int n) {
+  // acquire(&tx_lock);
 
-void uartputs(char *s) {
-  while (*s) {
-    uartputc(*s++);
+  int i = 0;
+  while (i < n) {
+    while (tx_busy != 0) {
+      // wait for a UART transmit-complete interrupt
+      // to set tx_busy to 0.
+      // sleep(&tx_chan, &tx_lock);
+    }
+
+    WriteReg(THR, buf[i]);
+    i += 1;
+    tx_busy = 1;
   }
+
+  // release(&tx_lock);
+}
+
+// write a byte to the uart without using
+// interrupts, for use by kernel printf() and
+// to echo characters. it spins waiting for the uart's
+// output register to be empty.
+void uartputc_sync(int c) {
+  // if (panicking == 0)
+  // push_off();
+
+  if (panicked) {
+    for (;;)
+      ;
+  }
+
+  // wait for Transmit Holding Empty to be set in LSR.
+  while ((ReadReg(LSR) & LSR_TX_IDLE) == 0)
+    ;
+  WriteReg(THR, c);
+
+  // if (panicking == 0)
+  // pop_off();
+}
+
+// read one input character from the UART.
+// return -1 if none is waiting.
+int uartgetc(void) {
+  if (ReadReg(LSR) & LSR_RX_READY) {
+    // input data is ready.
+    return ReadReg(RHR);
+  } else {
+    return -1;
+  }
+}
+
+// handle a uart interrupt, raised because input has
+// arrived, or the uart is ready for more output, or
+// both. called from devintr().
+int uartintr(void *dev_id) {
+  ReadReg(ISR); // acknowledge the interrupt
+
+  // acquire(&tx_lock);
+  if (ReadReg(LSR) & LSR_TX_IDLE) {
+    // UART finished transmitting; wake up sending thread.
+    tx_busy = 0;
+    // wakeup(&tx_chan);
+  }
+  // release(&tx_lock);
+
+  // read and process incoming characters.
+  while (1) {
+    int c = uartgetc();
+    if (c == -1)
+      break;
+    // consoleintr(c);
+  }
+
+  return IRQ_HANDLED;
 }
