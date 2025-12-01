@@ -5,19 +5,16 @@
 #include <stdarg.h>
 
 #include "types.h"
-#include "param.h"
-#include "memlayout.h"
-#include "riscv.h"
-#include "trap.h"
+#include "spinlock.h"
 #include "defs.h"
 
 volatile int panicking = 0; // printing a panic message
 volatile int panicked = 0;  // spinning forever at end of a panic
 
 // lock to avoid interleaving concurrent printf's.
-// static struct {
-// struct spinlock lock;
-// } pr;
+static struct {
+  struct spinlock lock;
+} pr;
 
 static char digits[] = "0123456789abcdef";
 
@@ -57,8 +54,8 @@ int printf(char *fmt, ...) {
   int i, cx, c0, c1, c2;
   char *s;
 
-  // if (panicking == 0)
-  // acquire(&pr.lock);
+  if (panicking == 0)
+    acquire(&pr.lock);
 
   va_start(ap, fmt);
   for (i = 0; (cx = fmt[i] & 0xff) != 0; i++) {
@@ -118,8 +115,8 @@ int printf(char *fmt, ...) {
   }
   va_end(ap);
 
-  // if (panicking == 0)
-  // release(&pr.lock);
+  if (panicking == 0)
+    release(&pr.lock);
 
   return 0;
 }
@@ -133,6 +130,4 @@ void panic(char *s) {
     ;
 }
 
-void printfinit(void) {
-  // initlock(&pr.lock, "pr");
-}
+void printfinit(void) { initlock(&pr.lock, "pr"); }

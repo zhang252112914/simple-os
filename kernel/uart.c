@@ -2,11 +2,8 @@
 // low-level driver routines for 16550a UART.
 //
 
-#include "types.h"
-#include "param.h"
 #include "memlayout.h"
-#include "riscv.h"
-#include "trap.h"
+#include "spinlock.h"
 #include "defs.h"
 
 // the UART control registers are memory-mapped
@@ -38,9 +35,9 @@
 #define WriteReg(reg, v) (*(Reg(reg)) = (v))
 
 // for transmission.
-// static struct spinlock tx_lock;
+static struct spinlock tx_lock;
 static int tx_busy; // is the UART busy sending?
-// static int tx_chan; // &tx_chan is the "wait channel"
+static int tx_chan; // &tx_chan is the "wait channel"
 
 extern volatile int panicking; // from printf.c
 extern volatile int panicked;  // from printf.c
@@ -68,23 +65,21 @@ void uartinit(void) {
   // enable transmit and receive interrupts.
   WriteReg(IER, IER_TX_ENABLE | IER_RX_ENABLE);
 
-  // initlock(&tx_lock, "uart");
-
-  register_interrupt(UART0_IRQ, uartintr, 0, "uart");
+  initlock(&tx_lock, "uart");
 }
 
 // transmit buf[] to the uart. it blocks if the
 // uart is busy, so it cannot be called from
 // interrupts, only from write() system calls.
 void uartwrite(char buf[], int n) {
-  // acquire(&tx_lock);
+  acquire(&tx_lock);
 
   int i = 0;
   while (i < n) {
     while (tx_busy != 0) {
       // wait for a UART transmit-complete interrupt
       // to set tx_busy to 0.
-      // sleep(&tx_chan, &tx_lock);
+      sleep(&tx_chan, &tx_lock);
     }
 
     WriteReg(THR, buf[i]);
@@ -92,7 +87,7 @@ void uartwrite(char buf[], int n) {
     tx_busy = 1;
   }
 
-  // release(&tx_lock);
+  release(&tx_lock);
 }
 
 // write a byte to the uart without using
@@ -100,8 +95,8 @@ void uartwrite(char buf[], int n) {
 // to echo characters. it spins waiting for the uart's
 // output register to be empty.
 void uartputc_sync(int c) {
-  // if (panicking == 0)
-  // push_off();
+  if (panicking == 0)
+    push_off();
 
   if (panicked) {
     for (;;)
@@ -113,8 +108,8 @@ void uartputc_sync(int c) {
     ;
   WriteReg(THR, c);
 
-  // if (panicking == 0)
-  // pop_off();
+  if (panicking == 0)
+    pop_off();
 }
 
 // read one input character from the UART.
@@ -131,24 +126,22 @@ int uartgetc(void) {
 // handle a uart interrupt, raised because input has
 // arrived, or the uart is ready for more output, or
 // both. called from devintr().
-int uartintr(void *dev_id) {
+void uartintr(void) {
   ReadReg(ISR); // acknowledge the interrupt
 
-  // acquire(&tx_lock);
+  acquire(&tx_lock);
   if (ReadReg(LSR) & LSR_TX_IDLE) {
     // UART finished transmitting; wake up sending thread.
     tx_busy = 0;
-    // wakeup(&tx_chan);
+    wakeup(&tx_chan);
   }
-  // release(&tx_lock);
+  release(&tx_lock);
 
   // read and process incoming characters.
   while (1) {
     int c = uartgetc();
     if (c == -1)
       break;
-    // consoleintr(c);
+    consoleintr(c);
   }
-
-  return IRQ_HANDLED;
 }

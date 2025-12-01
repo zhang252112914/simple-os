@@ -3,11 +3,9 @@
 // and pipe buffers. Allocates whole 4096-byte pages.
 
 #include "types.h"
-#include "param.h"
 #include "memlayout.h"
-// #include "spinlock.h"
+#include "spinlock.h"
 #include "riscv.h"
-#include "trap.h"
 #include "defs.h"
 
 void freerange(void *pa_start, void *pa_end);
@@ -20,12 +18,12 @@ struct run {
 };
 
 struct {
-  // struct spinlock lock;
+  struct spinlock lock;
   struct run *freelist;
 } kmem;
 
 void kinit() {
-  // initlock(&kmem.lock, "kmem");
+  initlock(&kmem.lock, "kmem");
   freerange(end, (void *)PHYSTOP);
 }
 
@@ -51,10 +49,10 @@ void kfree(void *pa) {
 
   r = (struct run *)pa;
 
-  // acquire(&kmem.lock);
+  acquire(&kmem.lock);
   r->next = kmem.freelist;
   kmem.freelist = r;
-  // release(&kmem.lock);
+  release(&kmem.lock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -63,11 +61,11 @@ void kfree(void *pa) {
 void *kalloc(void) {
   struct run *r;
 
-  // acquire(&kmem.lock);
+  acquire(&kmem.lock);
   r = kmem.freelist;
   if (r)
     kmem.freelist = r->next;
-  // release(&kmem.lock);
+  release(&kmem.lock);
 
   if (r)
     memset((char *)r, 5, PGSIZE); // fill with junk

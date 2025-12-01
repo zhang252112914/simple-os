@@ -1,21 +1,35 @@
-# Minimal RISC-V Kernel Makefile
+K=kernel
+U=user
 
 # Kernel object files
 OBJS = \
-  kernel/entry.o \
-  kernel/start.o \
-  kernel/console.o \
-  kernel/printf.o \
-  kernel/uart.o \
-  kernel/kalloc.o \
-  kernel/string.o \
-  kernel/vm.o \
-  kernel/trampoline.o \
-  kernel/trap.o \
-  kernel/kernelvec.o \
-  kernel/plic.o \
-  kernel/kerneltest.o \
-  kernel/main.o
+  $K/entry.o \
+  $K/start.o \
+  $K/console.o \
+  $K/printf.o \
+  $K/uart.o \
+  $K/kalloc.o \
+  $K/string.o \
+  $K/vm.o \
+  $K/trampoline.o \
+  $K/trap.o \
+  $K/kernelvec.o \
+  $K/plic.o \
+  $K/spinlock.o \
+  $K/proc.o \
+  $K/swtch.o \
+  $K/sleeplock.o \
+  $K/bio.o \
+  $K/virtio_disk.o \
+  $K/fs.o \
+  $K/file.o \
+  $K/pipe.o \
+  $K/log.o \
+  $K/exec.o \
+  $K/syscall.o \
+  $K/sysfile.o \
+  $K/sysproc.o \
+  $K/main.o
 
 # Try to infer the correct TOOLPREFIX if not set
 ifndef TOOLPREFIX
@@ -67,44 +81,70 @@ endif
 # Linker flags
 LDFLAGS = -z max-page-size=4096
 
-# Default target
-all: kernel/kernel
+$K/kernel: $(OBJS) $K/kernel.ld
+	$(LD) $(LDFLAGS) -T $K/kernel.ld -o $K/kernel $(OBJS) 
+	$(OBJDUMP) -S $K/kernel > $K/kernel.asm
+	$(OBJDUMP) -t $K/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $K/kernel.sym
 
-# Build kernel
-kernel/kernel: $(OBJS) kernel/kernel.ld
-	$(LD) $(LDFLAGS) -T kernel/kernel.ld -o kernel/kernel $(OBJS) 
-	$(OBJDUMP) -S kernel/kernel > kernel/kernel.asm
-	$(OBJDUMP) -t kernel/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > kernel/kernel.sym
+$K/%.o: $K/%.S
+	$(CC) -g -c -o $@ $<
 
-# Compile C files
-kernel/%.o: kernel/%.c
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-# Compile assembly files  
-kernel/%.o: kernel/%.S
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-# Generate tags
 tags: $(OBJS)
 	etags kernel/*.S kernel/*.c
 
-# Include dependency files
+ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o
+
+_%: %.o $(ULIB) $U/user.ld
+	$(LD) $(LDFLAGS) -T $U/user.ld -o $@ $< $(ULIB)
+	$(OBJDUMP) -S $@ > $*.asm
+	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $*.sym
+
+$U/usys.S : $U/usys.pl
+	perl $U/usys.pl > $U/usys.S
+
+$U/usys.o : $U/usys.S
+	$(CC) $(CFLAGS) -c -o $U/usys.o $U/usys.S
+
+mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
+	gcc -I. -o mkfs/mkfs mkfs/mkfs.c
+
+# Prevent deletion of intermediate files, e.g. cat.o, after first build, so
+# that disk image changes after first build are persistent until clean.  More
+# details:
+# http://www.gnu.org/software/make/manual/html_node/Chained-Rules.html
+.PRECIOUS: %.o
+
+UPROGS=\
+	$U/_init\
+	$U/_kill\
+	$U/_sh\
+	$U/_usertests\
+
+fs.img: mkfs/mkfs $(UPROGS)
+	mkfs/mkfs fs.img $(UPROGS)
+
 -include kernel/*.d
 
-# Clean build artifacts
 clean: 
-	rm -f kernel/*.o kernel/*.d kernel/*.asm kernel/*.sym \
-	kernel/kernel .gdbinit tags
+	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
+	*/*.o */*.d */*.asm */*.sym \
+	$K/kernel fs.img \
+	mkfs/mkfs .gdbinit \
+        $U/usys.S \
+	$(UPROGS)
 
 # QEMU configuration
 ifndef CPUS
 CPUS := 1
 endif
 
-QEMUOPTS = -machine virt -bios none -kernel kernel/kernel -m 128M -smp $(CPUS) -nographic
+QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+QEMUOPTS += -global virtio-mmio.force-legacy=false
+QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
+QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 
 # Run kernel in QEMU
-qemu: kernel/kernel
+qemu: $K/kernel fs.img
 	$(QEMU) $(QEMUOPTS)
 
 # GDB debugging setup
@@ -122,5 +162,3 @@ qemu-gdb: kernel/kernel .gdbinit
 
 print-gdbport:
 	@echo $(GDBPORT)
-
-.PHONY: all clean qemu qemu-gdb tags print-gdbport

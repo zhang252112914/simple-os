@@ -1,3 +1,6 @@
+#ifndef PARAM_H
+#define PARAM_H
+
 #define NPROC 64                    // maximum number of processes
 #define NOFILE 16                   // open files per process
 #define NFILE 100                   // open files per system
@@ -14,3 +17,5 @@
 #define MAX_IRQS 64                 // maximum number of IRQs
 #define MAX_HANDLERS_PER_IRQ 4      // maximum handlers for each IRQ
 #define MAX_INTERRUPT_DEPTH 3       // maximum nested interrupt depth
+
+#endif // PARAM_H

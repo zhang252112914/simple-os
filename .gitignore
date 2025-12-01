@@ -1,8 +1,12 @@
 CLAUDE.md
+AGENTS.md
 *.o
 *.d
 *.asm
 *.sym
 kernel/kernel
+user/_*
+user/usys.S
 .gdbinit
+fs.img
 compile_commands.json

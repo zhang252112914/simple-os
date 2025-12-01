@@ -10,4 +10,9 @@ CompileFlags:
 If:
   PathMatch: kernel/trap\.h$
 CompileFlags:
-  Add: [-include, kernel/param.h]
+  Add: [-include, kernel/param.h, -include, kernel/spinlock.h]
+---
+If:
+  PathMatch: kernel/proc\.h$
+CompileFlags:
+  Add: [-include, kernel/param.h, -include, kernel/riscv.h, -include, kernel/spinlock.h]
