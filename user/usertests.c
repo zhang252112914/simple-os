@@ -1,5 +1,8 @@
 #include "kernel/param.h"
+#include "kernel/fcntl.h"
 #include "user/user.h"
+
+#include <stddef.h>
 
 #define assert(expr)                                                           \
   do {                                                                         \
@@ -140,10 +143,82 @@ void test_synchronization(void) {
   printf("Synchronization test completed\n");
 }
 
+void test_basic_syscalls(void) {
+  printf("Testing basic syscalls...\n");
+  int pid = getpid();
+  printf("Current PID: %d\n", pid);
+
+  int child_pid = fork();
+  if (child_pid == 0) {
+    // Child process
+    printf("In child process with PID: %d\n", getpid());
+    exit(42);
+  } else if (child_pid > 0) {
+    // Parent process
+    int status;
+    wait(&status);
+    printf("Child exited with status: %d\n", status);
+  } else {
+    printf("Fork failed\n");
+  }
+}
+
+void test_parameter_passing(void) {
+  char buffer[] = "Hello, World!\n";
+  int fd = open("console", O_RDWR);
+  printf("%d\n", fd);
+
+  if (fd < 0) {
+    printf("Failed to open console\n");
+    return;
+  }
+
+  int bytes_written = write(fd, buffer, sizeof(buffer));
+  printf("Wrote %d bytes\n", bytes_written);
+
+  write(-1, buffer, 10);
+  write(fd, NULL, 10);
+  write(fd, buffer, -1);
+
+  close(fd);
+}
+
+void test_security(void) {
+  char *invalid_ptr = (char *)0x1000000;
+  int result = write(1, invalid_ptr, 10);
+  printf("Invalid pointer write result: %d\n", result);
+
+  // Feed controlled input via a pipe so this test is non-interactive.
+  int p[2];
+  assert(pipe(p) == 0);
+  const char *payload = "abcdefghij";
+  write(p[1], payload, 10);
+  close(p[1]);
+
+  char small_buffer[4];
+  result = read(p[0], small_buffer, 10);
+  printf("Buffer overflow read result: %d\n", result);
+  close(p[0]);
+}
+
+void test_syscall_performance(void) {
+  uint64 start = uptime();
+  for (int i = 0; i < 10000; i++) {
+    getpid();
+  }
+
+  uint64 end = uptime();
+  printf("10000 getpid() calls took %lu cycles\n", end - start);
+}
+
 int main(int argc, char *argv[]) {
   test_process_creation();
   test_scheduler();
   test_synchronization();
+  test_basic_syscalls();
+  test_parameter_passing();
+  test_security();
+  test_syscall_performance();
   printf("All user tests passed\n");
   exit(0);
 }

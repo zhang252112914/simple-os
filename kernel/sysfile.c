@@ -64,6 +64,8 @@ uint64 sys_read(void) {
 
   argaddr(1, &p);
   argint(2, &n);
+  if (p == 0 || n < 0)
+    return -1;
   if (argfd(0, 0, &f) < 0)
     return -1;
   return fileread(f, p, n);
@@ -76,6 +78,8 @@ uint64 sys_write(void) {
 
   argaddr(1, &p);
   argint(2, &n);
+  if (p == 0 || n < 0)
+    return -1;
   if (argfd(0, 0, &f) < 0)
     return -1;
 

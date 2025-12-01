@@ -1,982 +1,949 @@
+# 系统调用实验报告：系统设计原理与实现逻辑分析
 
+## 1. 系统调用全链路追踪 (The System Call Lifecycle)
 
-## 一、核心运行机制与流程图解 (Execution Flow Analysis)
+以 `getpid()` 系统调用为例，完整追踪从用户态到内核态再返回的全过程。
 
-### 场景一:从创建到运行 (Fork & Exec Flow)
+### 1.1 触发阶段：用户空间到硬件陷入
 
-#### 1.1 Fork系统调用的完整生命周期
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  用户程序                                                        │
+│  pid = getpid();                                                │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  usys.S (由 usys.pl 生成)                                        │
+│  .global getpid                                                 │
+│  getpid:                                                        │
+│      li a7, SYS_getpid    # 将系统调用号 11 加载到 a7 寄存器      │
+│      ecall                 # 触发环境调用异常                    │
+│      ret                   # 返回用户程序                        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  RISC-V 硬件响应 ecall 指令                                      │
+│  1. scause ← 8 (Environment call from U-mode)                   │
+│  2. sepc ← PC (保存 ecall 指令的地址)                            │
+│  3. sstatus.SPP ← 0 (记录来自用户模式)                           │
+│  4. sstatus.SIE ← 0 (禁用中断)                                   │
+│  5. PC ← stvec (跳转到陷阱处理程序入口)                          │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-当用户进程调用 `fork()` 时,系统将经历以下完整的状态转换链路:
+**为什么需要 `a7` 寄存器？**
 
-**第一阶段:进程控制块的分配与初始化**
+`usys.pl` 脚本为每个系统调用生成汇编存根代码：
 
-从 `allocproc()` 开始,内核需要在进程表中寻找一个状态为 `UNUSED` 的槽位。因为进程表是一个固定大小的数组(定义在 proc.c 中的 `struct proc proc[NPROC]`),所以内核必须通过线性扫描来定位空闲槽位:
+```perl
+sub entry {
+    my $name = shift;
+    print ".global $name\n";
+    print "${name}:\n";
+    print " li a7, SYS_${name}\n";  # 系统调用号放入 a7
+    print " ecall\n";                # 触发陷阱
+    print " ret\n";
+}
+```
+
+RISC-V 调用约定规定 `a0-a7` 用于参数传递，其中 `a7` 专门用于承载系统调用号。这样设计的原因是：`a0-a5` 留给系统调用的实际参数，`a0` 还要用于返回值。
+
+**硬件做了什么？**
+
+当 `ecall` 执行时，CPU 硬件自动完成以下操作：
+- **`scause`** 寄存器被设置为 8（用户态环境调用），这让内核知道陷入原因
+- **`sepc`** 保存当前 PC（即 `ecall` 指令地址），用于返回时恢复执行位置
+- **`sstatus.SPP`** 位记录陷入前的特权级别（0 表示用户态）
+- PC 跳转到 **`stvec`** 寄存器指向的地址
+
+### 1.2 入口与分发：Trampoline 与上下文切换
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  stvec 指向 TRAMPOLINE (虚拟地址最高页)                          │
+│  为什么需要 trampoline？                                         │
+│  - 用户进程和内核都需要访问这段代码                              │
+│  - 它被映射到每个进程页表的固定位置 (TRAMPOLINE)                  │
+│  - 切换页表前后，这个虚拟地址都有效                              │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  trampoline.S :: uservec                                        │
+│                                                                 │
+│  # 此时还在用户页表下运行！                                      │
+│  # a0 被用作临时寄存器，需要先保存                               │
+│                                                                 │
+│  1. csrw sscratch, a0      # 临时保存 a0 到 sscratch             │
+│  2. li a0, TRAPFRAME       # a0 ← trapframe 地址                 │
+│  3. sd ra, 40(a0)          # 保存所有通用寄存器到 trapframe       │
+│     sd sp, 48(a0)                                               │
+│     ... (保存 t0-t6, s0-s11, a0-a7 等)                          │
+│  4. csrr t0, sscratch      # 取回原 a0 值                        │
+│     sd t0, 112(a0)         # 保存原 a0                           │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  切换到内核环境                                                  │
+│                                                                 │
+│  ld sp, 8(a0)              # sp ← 内核栈指针 (trapframe->kernel_sp)│
+│  ld tp, 32(a0)             # tp ← hartid (trapframe->kernel_hartid)│
+│  ld t0, 16(a0)             # t0 ← usertrap 函数地址              │
+│  ld t1, 0(a0)              # t1 ← 内核页表 satp 值               │
+│  csrw satp, t1             # 切换到内核页表！                    │
+│  sfence.vma zero, zero     # 刷新 TLB                            │
+│  jr t0                     # 跳转到 usertrap()                   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  trap.c :: usertrap()                                           │
+│                                                                 │
+│  w_stvec((uint64)kernelvec);  # 切换陷阱向量到内核模式           │
+│  p->trapframe->epc = r_sepc(); # 保存用户 PC                     │
+│                                                                 │
+│  if(r_scause() == 8) {        # 检查是否是系统调用               │
+│      p->trapframe->epc += 4;  # 返回时跳过 ecall 指令            │
+│      intr_on();               # 允许中断                         │
+│      syscall();               # 调用系统调用分发器               │
+│  }                                                              │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  syscall.c :: syscall()                                         │
+│                                                                 │
+│  int num = p->trapframe->a7;  # 从 a7 获取系统调用号             │
+│                                                                 │
+│  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {        │
+│      p->trapframe->a0 = syscalls[num]();  # 执行并存储返回值     │
+│  } else {                                                       │
+│      p->trapframe->a0 = -1;   # 非法调用号返回 -1                │
+│  }                                                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**为什么需要 Trampoline 页？**
+
+这是一个精妙的设计。问题在于：当 CPU 执行 `ecall` 后跳转到陷阱处理代码时，**页表还是用户进程的页表**。但陷阱处理代码在内核中，如果直接切换页表，当前正在执行的代码地址就会失效！
+
+解决方案是 Trampoline（蹦床）页：
+1. 它被映射到**每个用户进程页表**和**内核页表**的相同虚拟地址 (`TRAMPOLINE = MAXVA - PGSIZE`)
+2. 无论使用哪个页表，这个虚拟地址都指向同一段物理内存
+3. 这样在切换页表的瞬间，代码地址仍然有效
+
+**系统调用号如何映射到内核函数？**
+
+在 `syscall.c` 中，通过函数指针数组实现分发：
 
 ```c
-// 遍历进程表寻找UNUSED槽位
-for(p = proc; p < &proc[NPROC]; p++) {
-  acquire(&p->lock);
-  if(p->state == UNUSED) {
-    goto found;
+static uint64 (*syscalls[])(void) = {
+    [SYS_fork]    sys_fork,
+    [SYS_exit]    sys_exit,
+    [SYS_wait]    sys_wait,
+    // ...
+    [SYS_getpid]  sys_getpid,  // syscalls[11] = sys_getpid
+};
+```
+
+`syscall()` 函数从 `trapframe->a7` 读取系统调用号，直接作为数组索引找到对应函数。
+
+### 1.3 返回机制：从内核态回到用户态
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  内核函数执行完毕                                                │
+│  sys_getpid() 返回 p->pid                                       │
+│  返回值被 syscall() 写入 p->trapframe->a0                        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  trap.c :: usertrapret()                                        │
+│                                                                 │
+│  intr_off();              # 关中断                               │
+│  w_stvec(TRAMPOLINE + (uservec - trampoline)); # 恢复用户陷阱向量│
+│                                                                 │
+│  # 准备 trapframe 供 userret 使用                                │
+│  p->trapframe->kernel_satp = r_satp();                          │
+│  p->trapframe->kernel_sp = p->kstack + PGSIZE;                  │
+│  p->trapframe->kernel_trap = (uint64)usertrap;                  │
+│  p->trapframe->kernel_hartid = r_tp();                          │
+│                                                                 │
+│  # 设置 sstatus，准备返回用户态                                  │
+│  w_sepc(p->trapframe->epc);  # 恢复用户 PC                       │
+│                                                                 │
+│  # 跳转到 trampoline 的 userret                                  │
+│  uint64 fn = TRAMPOLINE + (userret - trampoline);               │
+│  ((void (*)(uint64,uint64))fn)(TRAPFRAME, satp);                │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  trampoline.S :: userret                                        │
+│                                                                 │
+│  csrw satp, a1            # 切换到用户页表                       │
+│  sfence.vma zero, zero    # 刷新 TLB                             │
+│                                                                 │
+│  # 从 trapframe 恢复所有用户寄存器                               │
+│  ld ra, 40(a0)                                                  │
+│  ld sp, 48(a0)                                                  │
+│  ld a0, 112(a0)           # 最后恢复 a0（包含系统调用返回值）    │
+│                                                                 │
+│  sret                     # 返回用户态                           │
+│  # 硬件自动：PC ← sepc, 特权级 ← sstatus.SPP                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**返回值传递的关键路径：**
+1. `sys_getpid()` 返回 `myproc()->pid`
+2. `syscall()` 将返回值写入 `p->trapframe->a0`
+3. `userret` 从 trapframe 恢复 `a0` 寄存器
+4. 用户程序从 `a0` 读取到返回值
+
+---
+
+## 2. 参数传递与内存屏障 (Data Transfer & Memory Safety)
+
+### 2.1 参数提取机制
+
+系统调用参数通过 RISC-V 调用约定存放在 `a0-a5` 寄存器中，这些值在陷入时被保存到 `trapframe`。
+
+```c
+// syscall.c - 参数提取函数
+
+// 获取第 n 个参数（通用寄存器值）
+static uint64 argraw(int n)
+{
+  struct proc *p = myproc();
+  switch (n) {
+  case 0: return p->trapframe->a0;
+  case 1: return p->trapframe->a1;
+  case 2: return p->trapframe->a2;
+  case 3: return p->trapframe->a3;
+  case 4: return p->trapframe->a4;
+  case 5: return p->trapframe->a5;
   }
-  release(&p->lock);
-}
-```
-
-这里的关键设计点在于:**为什么要在检查 `p->state` 之前就持有锁?** 因为在多核系统中,如果不持锁,可能出现两个CPU同时发现同一个槽位为 `UNUSED`,从而导致进程表损坏。
-
-**第二阶段:内核栈与上下文的初始化**
-
-找到空闲槽位后,内核需要为新进程分配内核栈,并初始化其 `context` 结构。观察 `allocproc()` 中的关键代码:
-
-```c
-// 分配一页作为trapframe
-if((p->trapframe = (struct trapframe *)kalloc()) == 0){
-  freeproc(p);
-  return 0;
-}
-
-// 初始化上下文,设置返回地址为forkret
-memset(&p->context, 0, sizeof(p->context));
-p->context.ra = (uint64)forkret;
-p->context.sp = p->kstack + PGSIZE;
-```
-
-这里揭示了一个核心机制:**为什么 `context.ra` 要设置为 `forkret`?** 因为这个新进程此时并没有运行过,它没有真正的"返回地址"。当调度器第一次通过 `swtch()` 切换到这个进程时,会从 `context.ra` 指向的地址开始执行。因此,`forkret` 充当了"伪造的返回点",它会完成一些首次运行的初始化工作,然后跳转到用户态。
-
-**第三阶段:地址空间的复制**
-
-在 `fork()` 实现中,父进程的虚拟地址空间需要被完整复制:
-
-```c
-// 复制用户内存空间
-if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
-  freeproc(np);
+  panic("argraw");
   return -1;
 }
-np->sz = p->sz;
-```
 
-这里使用的是 `uvmcopy()` 函数,它逐页复制父进程的物理页面。因为RISC-V使用三级页表,所以复制过程必须遍历整个页表结构,为子进程建立完全独立的映射关系。
+// 获取整数参数
+int argint(int n, int *ip)
+{
+  *ip = argraw(n);
+  return 0;
+}
 
-**第四阶段:Trapframe的伪造 — 解决"神奇返回"之谜**
-
-这是 `fork` 机制中最精妙的部分。观察 `fork()` 中对 trapframe 的处理:
-
-```c
-// 复制父进程的trapframe
-*(np->trapframe) = *(p->trapframe);
-
-// 关键:设置子进程的返回值为0
-np->trapframe->a0 = 0;
-```
-
-**逻辑推演:为什么子进程能从相同位置继续执行?**
-
-因为 `trapframe->epc` 保存的是父进程调用 `fork()` 时的 **程序计数器值**。当父进程陷入内核态执行系统调用时,硬件自动将 `pc` 保存到 `sepc` 寄存器中,内核又将其保存到 `trapframe->epc`。当子进程首次被调度时,它会通过 `usertrapret()` 和 `trampoline.S` 中的 `sret` 指令返回用户态,此时硬件会将 `trapframe->epc` 加载到 `pc` 中,从而使子进程"恰好"从父进程的 `fork` 调用点继续执行。
-
-但为什么返回值不同? 因为在 RISC-V 调用约定中,**系统调用的返回值存放在 `a0` 寄存器中**,而 `a0` 也被保存在 trapframe 中。父进程的 trapframe 保留了原始的 `a0` 值,所以父进程的 `fork()` 返回子进程的 PID;而子进程的 `trapframe->a0` 被人为设置为 0,所以子进程的 `fork()` 返回 0。
-
-**第五阶段:状态标记与调度准备**
-
-最后,子进程被标记为 `RUNNABLE`:
-
-```c
-acquire(&np->lock);
-np->state = RUNNABLE;
-release(&np->lock);
-```
-
-此时子进程进入调度队列,等待某个CPU的 `scheduler()` 循环选中它。
-
----
-
-### 场景二:进程调度与切换回路 (The Scheduler Loop)
-
-#### 2.1 从进程主动放弃CPU到重新获得CPU的完整路径
-
-**起点:进程调用 `yield()`**
-
-当一个进程时间片用完或主动让出CPU时,它会调用 `yield()`:
-
-```c
-void yield(void) {
-  struct proc *p = myproc();
-  acquire(&p->lock);
-  p->state = RUNNABLE;
-  sched();
-  release(&p->lock);
+// 获取地址参数
+int argaddr(int n, uint64 *ip)
+{
+  *ip = argraw(n);
+  return 0;
 }
 ```
 
-**关键逻辑点1:为什么要在持有 `p->lock` 的情况下修改 `p->state`?**
+**设计解析：**
+- `argraw()` 使用 switch 语句直接从 trapframe 的对应字段读取参数
+- `argint()` 和 `argaddr()` 是类型安全的包装函数
+- 参数编号 0-5 对应 `a0-a5` 寄存器
 
-因为在多核系统中,如果不持锁,其他CPU的调度器可能正在读取这个进程的状态。如果出现"先修改状态,后持锁"的操作顺序,可能导致调度器观察到不一致的状态(例如看到进程是 `RUNNABLE`,但它实际上还在运行中)。
-
-**传递点:`sched()` 的守门员职责**
-
-`sched()` 是进程上下文切换的"守门员",它进行一系列检查:
-
-```c
-void sched(void) {
-  struct proc *p = myproc();
-  
-  // 必须持有进程锁
-  if(!holding(&p->lock))
-    panic("sched p->lock");
-  
-  // 不能持有其他锁
-  if(mycpu()->noff != 1)
-    panic("sched locks");
-  
-  // 进程必须不在运行状态
-  if(p->state == RUNNING)
-    panic("sched running");
-  
-  // 中断必须关闭
-  if(intr_get())
-    panic("sched interruptible");
-
-  // 切换到调度器上下文
-  swtch(&p->context, &mycpu()->context);
-}
-```
-
-**关键逻辑点2:为什么要检查 `mycpu()->noff != 1`?**
-
-因为 `noff` 记录了当前CPU持有的锁的数量。如果 `noff > 1`,说明除了进程锁之外还持有其他锁。此时切换上下文会导致死锁 — 因为调度器可能会尝试获取这些已经被持有的锁。
-
-**核心切换点:`swtch()` 的魔法**
-
-`swtch()` 是整个操作系统中最底层的上下文切换实现:
-
-```assembly
-.globl swtch
-swtch:
-    # 保存旧上下文 (old context)
-    sd ra, 0(a0)
-    sd sp, 8(a0)
-    sd s0, 16(a0)
-    sd s1, 24(a0)
-    sd s2, 32(a0)
-    sd s3, 40(a0)
-    sd s4, 48(a0)
-    sd s5, 56(a0)
-    sd s6, 64(a0)
-    sd s7, 72(a0)
-    sd s8, 80(a0)
-    sd s9, 88(a0)
-    sd s10, 96(a0)
-    sd s11, 104(a0)
-
-    # 加载新上下文 (new context)
-    ld ra, 0(a1)
-    ld sp, 8(a1)
-    ld s0, 16(a1)
-    ld s1, 24(a1)
-    ld s2, 32(a1)
-    ld s3, 40(a1)
-    ld s4, 48(a1)
-    ld s5, 56(a1)
-    ld s6, 64(a1)
-    ld s7, 72(a1)
-    ld s8, 80(a1)
-    ld s9, 88(a1)
-    ld s10, 96(a1)
-    ld s11, 104(a1)
-    
-    ret
-```
-
-**深度逻辑剖析:为什么切换栈指针就等于切换执行流?**
-
-这是理解操作系统最核心的概念之一。让我们逐步推演:
-
-1. **栈的本质是什么?** 栈不仅存储局部变量,更重要的是存储**函数调用链**。每次函数调用时,返回地址会被压入栈中。
-
-2. **当 `sp` 被切换时发生了什么?** 假设进程A的栈指针是 `0x800001000`,调度器的栈指针是 `0x800002000`。当执行 `ld sp, 8(a1)` 时,如果 `a1` 指向调度器的 context,则 `sp` 被加载为 `0x800002000`。
-
-3. **`ret` 指令做了什么?** `ret` 在RISC-V中等价于 `jr ra`,即跳转到 `ra` 寄存器指向的地址。因为我们刚刚执行了 `ld ra, 0(a1)`,所以 `ra` 现在指向调度器上下文中保存的返回地址。
-
-4. **物理效果是什么?** CPU开始从新的栈上弹出函数调用帧,执行流完全切换到了另一个"世界"。如果这个上下文来自调度器,则CPU会继续执行 `scheduler()` 中 `swtch()` 之后的代码;如果来自某个进程,则会回到该进程的内核态代码。
-
-**到达调度器循环**
-
-当 `swtch()` 返回到 `scheduler()` 时,调度器继续它的无限循环:
+**Trapframe 结构中的寄存器布局：**
 
 ```c
-void scheduler(void) {
-  struct proc *p;
-  struct cpu *c = mycpu();
-  
-  c->proc = 0;
-  for(;;){
-    intr_on();
-    
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-        
-        c->proc = 0;
-      }
-      release(&p->lock);
-    }
-  }
-}
-```
-
-**关键逻辑点3:为什么在 `swtch` 之前需要持有 `p->lock`?**
-
-因为从检查 `p->state == RUNNABLE` 到执行 `swtch` 之间,如果不持锁,可能出现以下竞态条件:
-- CPU1 检查到进程P是 `RUNNABLE`
-- CPU2 也检查到进程P是 `RUNNABLE`
-- 两个CPU同时执行 `swtch`,试图运行同一个进程,导致灾难性后果
-
-**返回点:新进程被唤醒**
-
-当调度器选中某个 `RUNNABLE` 进程并执行 `swtch(&c->context, &p->context)` 时,CPU的执行流会"跳跃"到该进程上次调用 `sched()` 时保存的位置(即 `sched()` 中 `swtch()` 的下一条指令):
-
-```c
-void sched(void) {
+// proc.h
+struct trapframe {
+  uint64 kernel_satp;   //   0 - 内核页表
+  uint64 kernel_sp;     //   8 - 内核栈
+  uint64 kernel_trap;   //  16 - usertrap 地址
+  uint64 epc;           //  24 - 用户 PC
+  uint64 kernel_hartid; //  32 - CPU 核心 ID
+  uint64 ra;            //  40
+  uint64 sp;            //  48
+  // ... 其他寄存器
+  uint64 a0;            // 112 - 第一个参数/返回值
+  uint64 a1;            // 120
+  uint64 a2;            // 128
   // ...
-  swtch(&p->context, &mycpu()->context);
-  // 进程在这里"醒来"!
-}
-
-void yield(void) {
-  // ...
-  sched();
-  release(&p->lock);  // 进程继续执行这里
-}
+  uint64 a7;            // 168 - 系统调用号
+};
 ```
 
----
+### 2.2 跨空间数据拷贝：安全边界
 
-### 场景三:进程的消亡 (Exit & Wait Interaction)
+**核心问题：为什么内核不能直接解引用用户指针？**
 
-#### 3.1 Exit的状态转换与资源回收机制
+1. **地址空间隔离**：用户指针是用户页表下的虚拟地址，内核运行在内核页表下
+2. **安全威胁**：恶意用户可能传递指向内核空间的地址，试图读取/破坏内核数据
+3. **无效指针**：用户可能传递未映射的地址，直接解引用会导致内核崩溃
 
-**起点:进程调用 `exit()`**
-
-当进程完成工作或遇到错误时,它会调用 `exit()`:
-
-```c
-void exit(int status) {
-  struct proc *p = myproc();
-
-  // 关闭所有打开的文件
-  for(int fd = 0; fd < NOFILE; fd++){
-    if(p->ofile[fd]){
-      struct file *f = p->ofile[fd];
-      fileclose(f);
-      p->ofile[fd] = 0;
-    }
-  }
-
-  // 关闭当前工作目录
-  begin_op();
-  iput(p->cwd);
-  end_op();
-  p->cwd = 0;
-
-  acquire(&wait_lock);
-
-  // 将子进程过继给init进程
-  reparent(p);
-
-  // 唤醒父进程
-  wakeup(p->parent);
-
-  acquire(&p->lock);
-  p->xstate = status;
-  p->state = ZOMBIE;
-
-  release(&wait_lock);
-
-  // 永不返回
-  sched();
-  panic("zombie exit");
-}
-```
-
-**关键逻辑点1:为什么进程变成 `ZOMBIE` 而不是直接变成 `UNUSED`?**
-
-因为父进程可能需要通过 `wait()` 获取子进程的退出状态(`xstate`)。如果立即释放进程控制块,这些信息就会丢失。`ZOMBIE` 状态表示:"我已经死了,但我的尸体还有用"。
-
-**关键逻辑点2:为什么需要 `reparent()`?**
-
-观察 `reparent()` 的实现:
+**解决方案：页表遍历验证**
 
 ```c
-void reparent(struct proc *p) {
-  struct proc *pp;
-  for(pp = proc; pp < &proc[NPROC]; pp++){
-    if(pp->parent == p){
-      pp->parent = initproc;
-      wakeup(initproc);
-    }
-  }
-}
-```
+// vm.c - copyout: 从内核拷贝数据到用户空间
+int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+{
+  uint64 n, va0, pa0;
 
-因为如果一个进程的所有子进程还没退出,它就直接消失了,这些子进程将成为"孤儿进程"。Unix的设计哲学是:**所有进程必须有父进程**。所以操作系统将这些孤儿过继给 `init` 进程(PID=1),由 `init` 负责回收它们。
-
-**关键逻辑点3:`wait_lock` 和 `p->lock` 的双重保护**
-
-注意代码中的锁的获取顺序:
-
-```c
-acquire(&wait_lock);
-// ... reparent & wakeup ...
-acquire(&p->lock);
-p->state = ZOMBIE;
-release(&wait_lock);
-sched();
-```
-
-**为什么要先获取 `wait_lock`?** 因为父进程的 `wait()` 也会持有这个锁。这样可以保证在 `exit` 设置状态和 `wait` 读取状态之间不会出现竞态条件。
-
-**为什么要在 `sched()` 之前 release `wait_lock`?** 因为 `sched()` 要求调用者只持有进程锁,不能持有其他锁(前文提到的 `noff == 1` 检查)。
-
-#### 3.2 Wait的轮询与唤醒机制
-
-**父进程的等待循环**
-
-观察 `wait()` 的实现:
-
-```c
-int wait(uint64 addr) {
-  struct proc *pp;
-  int havekids, pid;
-  struct proc *p = myproc();
-
-  acquire(&wait_lock);
-
-  for(;;){
-    havekids = 0;
-    for(pp = proc; pp < &proc[NPROC]; pp++){
-      if(pp->parent == p){
-        acquire(&pp->lock);
-        havekids = 1;
-        if(pp->state == ZOMBIE){
-          // 找到僵尸子进程,回收资源
-          pid = pp->pid;
-          if(addr != 0 && copyout(p->pagetable, addr, 
-                                  (char *)&pp->xstate,
-                                  sizeof(pp->xstate)) < 0) {
-            release(&pp->lock);
-            release(&wait_lock);
-            return -1;
-          }
-          freeproc(pp);
-          release(&pp->lock);
-          release(&wait_lock);
-          return pid;
-        }
-        release(&pp->lock);
-      }
-    }
-
-    if(!havekids || killed(p)){
-      release(&wait_lock);
-      return -1;
-    }
-
-    // 等待子进程退出
-    sleep(p, &wait_lock);
-  }
-}
-```
-
-**关键逻辑点4:为什么 `wait()` 需要在循环中?**
-
-因为 `sleep()` 可能被虚假唤醒(spurious wakeup)。在多核系统中,可能发生以下情况:
-1. 进程A在等待子进程B
-2. 子进程C(也是A的子进程)退出,调用 `wakeup(A)`
-3. A被唤醒,但它发现C已经被回收了,B还没退出
-4. A必须重新进入 `sleep`
-
-因此,**永远不要假设被唤醒就意味着条件满足**,必须重新检查条件。
-
-**关键逻辑点5:`sleep/wakeup` 的握手协议**
-
-注意 `sleep` 的调用方式:
-
-```c
-sleep(p, &wait_lock);
-```
-
-这里传入了 `wait_lock`。观察 `sleep()` 的实现:
-
-```c
-void sleep(void *chan, struct spinlock *lk) {
-  struct proc *p = myproc();
-  
-  acquire(&p->lock);
-  release(lk);  // 先释放调用者的锁
-
-  p->chan = chan;
-  p->state = SLEEPING;
-
-  sched();
-
-  p->chan = 0;
-
-  release(&p->lock);
-  acquire(lk);  // 重新获取调用者的锁
-}
-```
-
-**为什么要这样设计?** 因为如果不在 `sleep` 内部释放 `wait_lock`,会出现"丢失唤醒"问题:
-
-**错误的设计(没有锁交接):**
-```c
-// 父进程
-release(&wait_lock);
-sleep(p, &wait_lock);  // 假设sleep不自动release
-
-// 子进程
-acquire(&wait_lock);
-wakeup(parent);
-release(&wait_lock);
-```
-
-时序分析:
-1. 父进程释放 `wait_lock`
-2. **此时子进程执行 `wakeup`,但父进程还没进入 `sleep`!**
-3. 父进程进入 `sleep`,永久睡眠(因为唤醒信号已经错过了)
-
-**正确的设计(原子锁交接):**
-```c
-// sleep内部保证:持有wait_lock -> 修改状态为SLEEPING -> 释放wait_lock
-// 这样保证了wakeup不可能在状态修改之前执行
-```
-
----
-
-## 二、关键代码逻辑深度剖析 (Deep Code Logic)
-
-### 2.1 `scheduler()` — 调度器的无限轮回
-
-#### 核心代码结构分析
-
-```c
-void scheduler(void) {
-  struct proc *p;
-  struct cpu *c = mycpu();
-  
-  c->proc = 0;  // 标记当前CPU没有运行任何进程
-  
-  for(;;){
-    // 开启中断,允许时钟中断和设备中断
-    intr_on();
+  while(len > 0){
+    va0 = PGROUNDDOWN(dstva);
     
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      
-      if(p->state == RUNNABLE) {
-        // 找到可运行进程
-        p->state = RUNNING;
-        c->proc = p;
-        
-        // 切换到进程的上下文
-        swtch(&c->context, &p->context);
-        
-        // 当进程让出CPU时,会返回到这里
-        c->proc = 0;
-      }
-      release(&p->lock);
-    }
-  }
-}
-```
+    // 关键：通过 walkaddr 查找用户页表，验证地址合法性
+    pa0 = walkaddr(pagetable, va0);
+    if(pa0 == 0)
+      return -1;  // 地址未映射，拒绝操作
+    
+    n = PGSIZE - (dstva - va0);
+    if(n > len)
+      n = len;
+    
+    // 使用物理地址直接写入
+    memmove((void *)(pa0 + (dstva - va0)), src, n);
 
-#### 逐行逻辑注释
-
-**Q: 为什么外层是无限循环?**
-
-因为调度器是每个CPU核心的"永动机"。当系统启动后,每个CPU都会在 `start()` 和 `main()` 初始化完成后,进入 `scheduler()` 并永不退出。这是操作系统的基本运行模式:**CPU要么在运行用户进程,要么在运行调度器**。
-
-**Q: 为什么要在循环开始时调用 `intr_on()`?**
-
-因为在某些代码路径中(如 `sleep`),中断可能被关闭。如果调度器不重新开启中断,时钟中断将无法触发,进程调度将停止。但是,一旦 `swtch` 切换到进程上下文,该进程自己的中断状态将被恢复(因为 `swtch` 恢复了所有寄存器,包括 `sstatus`)。
-
-**Q: 如果所有进程都在 `SLEEPING`,调度器在做什么?**
-
-调度器会继续循环扫描进程表。在每次循环中:
-1. 扫描所有进程,发现都是 `SLEEPING`
-2. 循环结束,回到外层 `for(;;)`
-3. 执行 `intr_on()`,重新扫描
-
-在这个过程中,CPU实际上是"空转"的,在不断地轮询。这是一种简单但低效的实现。**更高级的操作系统会使用 `hlt` 指令让CPU进入低功耗状态,等待中断唤醒**。
-
-**Q: 为什么在 `swtch` 之前必须持有 `p->lock`?**
-
-这是防止多个CPU同时调度同一个进程的核心机制。考虑以下竞态条件:
-
-```
-时间线:
-T1: CPU0 检查到进程P是 RUNNABLE
-T2: CPU1 也检查到进程P是 RUNNABLE
-T3: CPU0 执行 p->state = RUNNING
-T4: CPU1 也执行 p->state = RUNNING (错误!)
-T5: CPU0 和 CPU1 同时通过 swtch 切换到进程P
-```
-
-结果:两个CPU同时运行同一个进程,导致栈冲突、寄存器混乱等灾难性后果。
-
-**通过持锁解决:**
-
-```
-时间线:
-T1: CPU0 acquire(&p->lock)
-T2: CPU0 检查到进程P是 RUNNABLE
-T3: CPU1 尝试 acquire(&p->lock) -> 阻塞等待
-T4: CPU0 执行 p->state = RUNNING
-T5: CPU0 执行 swtch
-T6: (稍后) 进程P调用 sched(),release(&p->lock)
-T7: CPU1 获取锁,发现 p->state == RUNNING,跳过
-```
-
-#### 并发保护的细节推敲
-
-观察 `swtch` 调用前后的锁状态:
-
-```c
-acquire(&p->lock);       // 调度器持有进程锁
-swtch(&c->context, &p->context);
-// swtch 返回时,仍然持有 p->lock!
-c->proc = 0;
-release(&p->lock);
-```
-
-**关键问题:为什么 `swtch` 返回后,锁还在调度器手里?**
-
-因为 `swtch` 只是切换了寄存器和栈,**并没有执行任何锁操作**。锁的状态是通过全局变量(锁结构体中的 `locked` 字段)维护的,不会因为上下文切换而改变。
-
-**那么,进程是如何释放这个锁的?**
-
-当进程通过 `yield()` -> `sched()` -> `swtch()` 切换回调度器时,观察代码路径:
-
-```c
-// yield中:
-acquire(&p->lock);
-sched();
-release(&p->lock);  // 在这里释放!
-```
-
-所以,**锁的所有权在逻辑上发生了转移**:
-1. 调度器获取锁
-2. 调度器切换到进程(物理上,锁仍然被持有)
-3. 进程运行
-4. 进程切换回调度器(物理上,锁仍然被持有)
-5. 调度器释放锁
-
-这种设计保证了:**从获取锁到释放锁的整个期间,进程的状态不会被其他CPU修改**。
-
----
-
-### 2.2 `allocproc()` — 进程的诞生仪式
-
-#### 核心代码结构
-
-```c
-static struct proc* allocproc(void) {
-  struct proc *p;
-
-  // 寻找UNUSED槽位
-  for(p = proc; p < &proc[NPROC]; p++) {
-    acquire(&p->lock);
-    if(p->state == UNUSED) {
-      goto found;
-    } else {
-      release(&p->lock);
-    }
+    len -= n;
+    src += n;
+    dstva = va0 + PGSIZE;
   }
   return 0;
+}
 
-found:
-  p->pid = allocpid();
-  p->state = USED;
+// vm.c - copyin: 从用户空间拷贝数据到内核
+int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+{
+  uint64 n, va0, pa0;
 
-  // 分配trapframe页
-  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
-    freeproc(p);
-    release(&p->lock);
+  while(len > 0){
+    va0 = PGROUNDDOWN(srcva);
+    pa0 = walkaddr(pagetable, va0);
+    if(pa0 == 0)
+      return -1;
+    
+    n = PGSIZE - (srcva - va0);
+    if(n > len)
+      n = len;
+    
+    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+
+    len -= n;
+    dst += n;
+    srcva = va0 + PGSIZE;
+  }
+  return 0;
+}
+```
+
+**`walkaddr` 的安全验证逻辑：**
+
+```c
+// vm.c
+uint64 walkaddr(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+
+  // 安全检查 1：地址不能超过最大用户虚拟地址
+  if(va >= MAXVA)
     return 0;
-  }
 
-  // 分配页表
-  p->pagetable = proc_pagetable(p);
-  if(p->pagetable == 0){
-    freeproc(p);
-    release(&p->lock);
+  // 通过页表遍历找到 PTE
+  pte = walk(pagetable, va, 0);
+  
+  // 安全检查 2：PTE 必须存在
+  if(pte == 0)
     return 0;
-  }
-
-  // 设置上下文,准备首次调度
-  memset(&p->context, 0, sizeof(p->context));
-  p->context.ra = (uint64)forkret;
-  p->context.sp = p->kstack + PGSIZE;
-
-  return p;
+  
+  // 安全检查 3：页面必须有效（V 位）
+  if((*pte & PTE_V) == 0)
+    return 0;
+  
+  // 安全检查 4：必须是用户可访问的页面（U 位）
+  if((*pte & PTE_U) == 0)
+    return 0;
+  
+  pa = PTE2PA(*pte);
+  return pa;
 }
 ```
 
-#### Trapframe 与 Context 的初始化逻辑
-
-**Q: Trapframe 和 Context 的本质区别是什么?**
-
-- **Trapframe**: 保存**用户态**的寄存器状态。当陷入内核(系统调用/中断)时,硬件和软件协同将用户态寄存器保存到 trapframe 中。定义在 proc.h:
+**字符串获取的安全实现：**
 
 ```c
-struct trapframe {
-  uint64 kernel_satp;   // 内核页表
-  uint64 kernel_sp;     // 内核栈指针
-  uint64 kernel_trap;   // 陷阱处理函数地址
-  uint64 epc;           // 用户程序计数器
-  uint64 kernel_hartid; // hart ID
-  uint64 ra;
-  uint64 sp;
-  uint64 gp;
-  uint64 tp;
-  // ... 其他通用寄存器 ...
-  uint64 a0;            // 系统调用返回值
-};
-```
-
-- **Context**: 保存**内核态**的寄存器状态。当进程在内核态主动让出CPU(如调用 `yield`)时,通过 `swtch` 将内核态寄存器保存到 context 中。定义在 proc.h:
-
-```c
-struct context {
-  uint64 ra;   // 返回地址
-  uint64 sp;   // 栈指针
-  uint64 s0;   // 被调用者保存寄存器
-  uint64 s1;
-  // ... s2 ~ s11 ...
-};
-```
-
-**Q: 为什么 Context 只保存 `ra`, `sp`, `s0-s11`?**
-
-因为根据 RISC-V 调用约定:**被调用者保存寄存器**(callee-saved registers)包括 `s0-s11` 和 `ra`、`sp`。当函数调用发生时,被调用函数必须保证这些寄存器在返回时恢复原值。而 **调用者保存寄存器**(caller-saved registers,如 `a0-a7`, `t0-t6`)由调用者负责保存。
-
-因此,`swtch` 只需要保存被调用者保存寄存器,因为它被视为一个"函数调用"。
-
-#### "伪造上下文"的精妙设计
-
-**Q: 为什么 `context.ra` 要设置为 `forkret`?**
-
-这是操作系统中最巧妙的设计之一。让我们追踪一个新进程的首次调度:
-
-1. **分配时刻**: `allocproc()` 设置 `p->context.ra = (uint64)forkret`
-2. **调度时刻**: 调度器执行 `swtch(&c->context, &p->context)`
-3. **`swtch` 内部**: 执行 `ld ra, 0(a1)`,将 `forkret` 地址加载到 `ra` 寄存器
-4. **`swtch` 结尾**: 执行 `ret`,等价于 `jr ra`,跳转到 `forkret`
-
-因此,`forkret` 充当了进程的"首次启动函数"。观察 `forkret()` 的实现:
-
-```c
-void forkret(void) {
-  static int first = 1;
-
-  release(&myproc()->lock);
-
-  if (first) {
-    first = 0;
-    fsinit(ROOTDEV);
-  }
-
-  usertrapret();
-}
-```
-
-**逻辑推演:为什么要释放 `myproc()->lock`?**
-
-因为调度器在执行 `swtch` 之前持有了这个锁(见前文分析)。当 `swtch` 切换到新进程时,锁的所有权被"转移"了,但锁仍然被持有。新进程必须主动释放它。
-
-**为什么不在调度器中释放?**
-
-因为调度器不知道切换到的是一个"首次运行"的进程,还是一个"被中断后恢复"的进程。对于后者,锁会在 `yield()` 的末尾被释放(见前文)。所以,**首次运行的进程必须自己负责释放锁**。
-
-**Q: 为什么 `context.sp` 设置为 `p->kstack + PGSIZE`?**
-
-因为RISC-V的栈是向下增长的。`p->kstack` 是内核栈的起始地址(低地址),`p->kstack + PGSIZE` 是栈的顶部(高地址)。将 `sp` 设置为栈顶,意味着栈是空的,准备接受新的函数调用帧。
-
----
-
-## 三、系统设计难点与解决方案 (Design Challenges)
-
-### 3.1 死锁预防:Sleep/Wakeup 的锁协议
-
-#### 问题背景:为什么需要锁?
-
-考虑一个典型的生产者-消费者场景:
-
-```c
-// 消费者
-while(buffer_empty()) {
-  sleep(&buffer);
-}
-consume();
-
-// 生产者
-produce();
-wakeup(&buffer);
-```
-
-**错误场景(无锁保护):**
-
-```
-时间线:
-T1: 消费者检查 buffer_empty() -> true
-T2: 生产者 produce(),调用 wakeup(&buffer)
-T3: 消费者调用 sleep(&buffer) -> 永久睡眠!
-```
-
-因为在T1和T3之间,生产者已经发出了唤醒信号,但消费者错过了它。
-
-#### 解决方案:条件锁(Condition Variable Lock)
-
-在xv6中,`sleep` 和 `wakeup` 使用一个共享锁来保护条件检查和状态修改:
-
-```c
-// 消费者
-acquire(&buffer_lock);
-while(buffer_empty()) {
-  sleep(&buffer, &buffer_lock);
-}
-consume();
-release(&buffer_lock);
-
-// 生产者
-acquire(&buffer_lock);
-produce();
-wakeup(&buffer);
-release(&buffer_lock);
-```
-
-**关键:sleep 的原子锁交接**
-
-观察 `sleep()` 的实现:
-
-```c
-void sleep(void *chan, struct spinlock *lk) {
+// vm.c - fetchstr: 安全地从用户空间获取字符串
+int fetchstr(uint64 addr, char *buf, int max)
+{
   struct proc *p = myproc();
   
-  acquire(&p->lock);  // 1. 先获取进程锁
-  release(lk);        // 2. 再释放条件锁
+  // 使用 copyinstr，它会：
+  // 1. 验证每个页面的映射
+  // 2. 检查 '\0' 终止符
+  // 3. 限制最大长度
+  if(copyinstr(p->pagetable, buf, addr, max) < 0)
+    return -1;
+  
+  return strlen(buf);
+}
 
-  p->chan = chan;
-  p->state = SLEEPING;
+int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+{
+  uint64 n, va0, pa0;
+  int got_null = 0;
 
-  sched();            // 3. 切换上下文
+  while(got_null == 0 && max > 0){
+    va0 = PGROUNDDOWN(srcva);
+    pa0 = walkaddr(pagetable, va0);
+    if(pa0 == 0)
+      return -1;
+    
+    n = PGSIZE - (srcva - va0);
+    if(n > max)
+      n = max;
 
-  p->chan = 0;
-  release(&p->lock);  // 4. 释放进程锁
-  acquire(lk);        // 5. 重新获取条件锁
+    char *p = (char *)(pa0 + (srcva - va0));
+    while(n > 0){
+      if(*p == '\0'){
+        *dst = '\0';
+        got_null = 1;
+        break;
+      } else {
+        *dst = *p;
+      }
+      --n;
+      --max;
+      p++;
+      dst++;
+    }
+
+    srcva = va0 + PGSIZE;
+  }
+  
+  if(got_null){
+    return 0;
+  } else {
+    return -1;  // 字符串未正常终止
+  }
 }
 ```
 
-**逐步推演:为什么这样设计能避免死锁?**
+---
 
-**第一步:先获取进程锁**
+## 3. 核心系统调用实现解析 (Key Implementation Details)
 
-因为要修改 `p->state`,必须持有 `p->lock`(这是多核并发保护的基本要求)。
+### 3.1 `sys_write` - 文件写入的完整路径
 
-**第二步:释放条件锁**
-
-在这一步之前,进程同时持有两个锁(`p->lock` 和 `lk`)。如果不释放 `lk`,可能出现:
-- 进程A在 `sleep` 中持有 `buffer_lock`
-- 进程B想要 `produce`,尝试获取 `buffer_lock` -> 阻塞
-- 进程B持有某个进程C的锁,导致调度器无法调度C
-- 形成锁依赖环,死锁!
-
-**第三步:在持有进程锁的情况下调用 `sched()`**
-
-这符合 `sched()` 的要求(见前文:`noff == 1`)。
-
-**第四步:唤醒后释放进程锁**
-
-当进程被 `wakeup` 唤醒后,它会从 `sched()` 返回。此时调度器已经 release 了进程锁(在 `swtch` 返回后)... **等等,这里有个陷阱!**
-
-**深度剖析:锁在 `swtch` 前后的传递**
-
-让我们重新审视 `sleep` 和 `wakeup` 的完整路径:
-
-**Sleep 路径:**
 ```c
-// 进程A调用:
-sleep(chan, &lk)
-  acquire(&p->lock)     // A持有p->lock
-  release(lk)
-  sched()
-    swtch(&p->context, &c->context)
-    // CPU切换到调度器
+// sysfile.c
+uint64 sys_write(void)
+{
+  struct file *f;
+  int n;
+  uint64 p;
+
+  // 步骤 1：提取参数
+  // a0 = fd (文件描述符)
+  // a1 = buf (用户缓冲区地址)  
+  // a2 = n (写入字节数)
+  argaddr(1, &p);
+  argint(2, &n);
+  
+  // 步骤 2：通过 argfd 验证并获取 file 结构
+  if(argfd(0, 0, &f) < 0)
+    return -1;
+  
+  // 步骤 3：调用文件系统层写入
+  return filewrite(f, p, n);
+}
 ```
 
-**调度器路径:**
+**`argfd` - 文件描述符验证与查找：**
+
 ```c
-scheduler()
-  acquire(&p->lock)     // 调度器持有p->lock
-  swtch(&c->context, &p->context)
-  // CPU切换到进程A
-  c->proc = 0
-  release(&p->lock)     // 调度器释放p->lock
+static int argfd(int n, int *pfd, struct file **pf)
+{
+  int fd;
+  struct file *f;
+
+  argint(n, &fd);
+  
+  // 边界检查 1：fd 必须非负
+  // 边界检查 2：fd 必须小于 NOFILE (16)
+  if(fd < 0 || fd >= NOFILE)
+    return -1;
+  
+  // 边界检查 3：进程的 ofile 数组中该位置必须有效
+  if((f = myproc()->ofile[fd]) == 0)
+    return -1;
+  
+  if(pfd)
+    *pfd = fd;
+  if(pf)
+    *pf = f;
+  return 0;
+}
 ```
 
-**错了!** 仔细看代码,调度器在 `swtch` **之前**就持有了 `p->lock`,并在 `swtch` **之后**释放它。那么,进程A何时释放这个锁?
-
-**答案:进程A在首次 `sleep` 时永远不会释放 `p->lock`,而是"转移"给调度器!**
-
-让我们重新梳理:
-
-1. 进程A: `acquire(&p->lock)` -> 持有锁
-2. 进程A: `swtch` -> 切换到调度器(锁仍然被持有,但逻辑上已转移给调度器)
-3. 调度器:恢复执行,发现自己持有 `p->lock`
-4. 调度器: `release(&p->lock)` -> 释放锁
-5. (稍后)调度器选中进程A: `acquire(&p->lock)` -> 重新获取锁
-6. 调度器: `swtch` -> 切换到进程A(锁被转移回进程A)
-7. 进程A:从 `swtch` 返回,发现自己持有 `p->lock`
-8. 进程A: `release(&p->lock)` -> 释放锁
-
-所以,**锁在进程和调度器之间来回传递,但在整个 `sleep` -> `wakeup` -> `schedule` -> `resume` 的过程中,总有人持有它**,这保证了状态的一致性。
-
-#### Wakeup 的实现细节
+**`filewrite` - 分发到具体设备：**
 
 ```c
-void wakeup(void *chan) {
-  struct proc *p;
+// file.c
+int filewrite(struct file *f, uint64 addr, int n)
+{
+  int r, ret = 0;
 
-  for(p = proc; p < &proc[NPROC]; p++) {
-    if(p != myproc()){
-      acquire(&p->lock);
-      if(p->state == SLEEPING && p->chan == chan) {
-        p->state = RUNNABLE;
-      }
-      release(&p->lock);
+  // 检查文件是否可写
+  if(f->writable == 0)
+    return -1;
+
+  if(f->type == FD_PIPE){
+    // 管道写入
+    ret = pipewrite(f->pipe, addr, n);
+  } else if(f->type == FD_DEVICE){
+    // 设备写入（如控制台）
+    if(f->major < 0 || f->major >= NDEV || !devsw[f->major].write)
+      return -1;
+    ret = devsw[f->major].write(1, addr, n);
+  } else if(f->type == FD_INODE){
+    // 普通文件写入
+    int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+    int i = 0;
+    while(i < n){
+      int n1 = n - i;
+      if(n1 > max)
+        n1 = max;
+
+      begin_op();  // 开始日志事务
+      ilock(f->ip);
+      
+      // writei 会调用 copyin 从用户空间读取数据
+      if ((r = writei(f->ip, 1, addr + i, f->off, n1)) > 0)
+        f->off += r;
+      
+      iunlock(f->ip);
+      end_op();  // 提交事务
+
+      if(r != n1)
+        break;
+      i += r;
+    }
+    ret = (i == n ? n : -1);
+  }
+  return ret;
+}
+```
+
+**数据流图：**
+
+```
+用户调用 write(fd, buf, n)
+         │
+         ▼
+    sys_write()
+         │
+         ├─ argfd() ─────────────────────────┐
+         │   验证 fd 范围 [0, NOFILE)         │
+         │   查找 proc->ofile[fd]            │
+         │                                   ▼
+         │                          struct file
+         │                          ├─ type (PIPE/DEVICE/INODE)
+         │                          ├─ ref (引用计数)
+         │                          ├─ readable/writable
+         │                          ├─ ip (inode 指针)
+         │                          └─ off (文件偏移)
+         │
+         ▼
+    filewrite(f, addr, n)
+         │
+         ├─── FD_DEVICE ───▶ devsw[major].write()
+         │                   └─ 如 consolewrite()
+         │
+         ├─── FD_PIPE ─────▶ pipewrite()
+         │
+         └─── FD_INODE ────▶ writei(ip, user=1, addr, off, n)
+                                    │
+                                    ▼
+                            copyin() 安全拷贝用户数据
+                                    │
+                                    ▼
+                            bread()/bwrite() 磁盘 I/O
+```
+
+### 3.2 `sys_sbrk` - 进程堆内存管理
+
+```c
+// sysproc.c
+uint64 sys_sbrk(void)
+{
+  uint64 addr;
+  int n;
+
+  argint(0, &n);  // 获取增长/收缩的字节数
+  addr = myproc()->sz;  // 保存当前堆顶地址
+  
+  // 调用 growproc 调整进程大小
+  if(growproc(n) < 0)
+    return -1;
+  
+  return addr;  // 返回调整前的堆顶
+}
+```
+
+**`growproc` - 进程内存调整的核心：**
+
+```c
+// proc.c
+int growproc(int n)
+{
+  uint64 sz;
+  struct proc *p = myproc();
+
+  sz = p->sz;
+  
+  if(n > 0){
+    // 增长内存
+    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+      return -1;
+    }
+  } else if(n < 0){
+    // 收缩内存
+    sz = uvmdealloc(p->pagetable, sz, sz + n);
+  }
+  
+  p->sz = sz;
+  return 0;
+}
+```
+
+**`uvmalloc` - 分配并映射新页面：**
+
+```c
+// vm.c
+uint64 uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+{
+  char *mem;
+  uint64 a;
+
+  if(newsz < oldsz)
+    return oldsz;
+
+  // 将 oldsz 向上取整到页边界
+  oldsz = PGROUNDUP(oldsz);
+  
+  for(a = oldsz; a < newsz; a += PGSIZE){
+    // 步骤 1：调用物理内存分配器获取一页
+    mem = kalloc();
+    if(mem == 0){
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
+    }
+    
+    // 步骤 2：清零新页面
+    memset(mem, 0, PGSIZE);
+    
+    // 步骤 3：在页表中建立映射
+    // 权限：可读 | 用户可访问 | 传入的额外权限（如可写）
+    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+      kfree(mem);
+      uvmdealloc(pagetable, a, oldsz);
+      return 0;
     }
   }
+  return newsz;
 }
 ```
 
-**Q: 为什么要检查 `p != myproc()`?**
+**内存分配流程图：**
 
-因为进程不能唤醒自己。如果一个进程正在调用 `wakeup`,它肯定不在 `SLEEPING` 状态。
+```
+sys_sbrk(n=4096)  // 请求增加一页
+      │
+      ▼
+  growproc(4096)
+      │
+      ▼
+  uvmalloc(pagetable, sz, sz+4096, PTE_W)
+      │
+      ├─────────────────────────────────────────┐
+      │                                         │
+      ▼                                         ▼
+  kalloc()                              mappages()
+  从空闲链表取一页                        修改页表
+      │                                         │
+      ▼                                         ▼
+  返回物理地址 pa                         walk() 遍历三级页表
+      │                                   创建/更新 PTE
+      │                                         │
+      ▼                                         ▼
+  memset(pa, 0, 4096)                     PTE = PA | PTE_V | PTE_R | 
+  清零新页面                                     PTE_U | PTE_W
 
-**Q: 为什么要逐个持有每个进程的锁?**
-
-因为要修改 `p->state`,必须持有 `p->lock`。这里采用的是"细粒度锁"策略:为每个进程单独持锁,而不是用一个全局锁保护整个进程表。这样可以提高并发性。
-
----
-
-### 3.2 首次调度的"伪造上下文"技巧
-
-#### 问题背景
-
-新创建的进程从未运行过,它没有"上一次运行时保存的寄存器状态"。但调度器的 `swtch` 机制依赖于"恢复上次保存的上下文"。**如何让一个从未运行过的进程被调度上台?**
-
-#### 解决方案:人为构造一个假的 Context
-
-在 `allocproc()` 中:
-
-```c
-memset(&p->context, 0, sizeof(p->context));
-p->context.ra = (uint64)forkret;
-p->context.sp = p->kstack + PGSIZE;
+进程页表变化：
+┌─────────────────┐
+│ 代码段 (.text)   │ 0x0
+├─────────────────┤
+│ 数据段 (.data)   │
+├─────────────────┤
+│ 原堆区           │ ← 原 p->sz
+├─────────────────┤
+│ 新分配页面       │ ← 新 p->sz = 原sz + 4096
+└─────────────────┘
 ```
 
-这相当于告诉调度器:"这个进程上次运行到了 `forkret` 函数,它的栈在 `p->kstack + PGSIZE`"。
-
-#### 首次调度的完整路径
-
-**第一步:调度器选中新进程**
+**`uvmdealloc` - 收缩内存并释放页面：**
 
 ```c
-scheduler()
-  acquire(&p->lock);
-  p->state = RUNNING;
-  swtch(&c->context, &p->context);
-```
+uint64 uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+{
+  if(newsz >= oldsz)
+    return oldsz;
 
-**第二步:`swtch` 恢复"伪造的上下文"**
-
-```assembly
-swtch:
-  # 保存调度器的上下文到 c->context
-  sd ra, 0(a0)
-  sd sp, 8(a0)
-  # ...
-
-  # 加载进程的上下文(这是伪造的!)
-  ld ra, 0(a1)      # ra = forkret
-  ld sp, 8(a1)      # sp = p->kstack + PGSIZE
-  # ...
-
-  ret               # 跳转到 ra,即 forkret
-```
-
-**第三步:进入 `forkret`**
-
-```c
-void forkret(void) {
-  static int first = 1;
-
-  release(&myproc()->lock);  // 释放调度器传递来的锁
-
-  if (first) {
-    first = 0;
-    fsinit(ROOTDEV);         // 初始化文件系统(仅首次)
+  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
+    int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+    // 参数 1 表示释放物理页面 (kfree)
   }
 
-  usertrapret();             // 返回用户态
+  return newsz;
 }
 ```
 
-**第四步:`usertrapret()` 准备用户态环境**
+---
 
-`usertrapret()` 会:
-1. 设置 trapframe(包含用户态寄存器值)
-2. 设置 RISC-V 的 `stvec` 指向用户态陷阱处理入口
-3. 调用 `trampoline.S` 中的 `userret`
+## 4. 安全性与边界处理 (Security & Edge Cases)
 
-**第五步:通过 `sret` 返回用户态**
+### 4.1 非法指针检测
 
-```assembly
-userret:
-  # 恢复用户态寄存器(从trapframe加载)
-  ld ra, 40(a0)
-  ld sp, 48(a0)
-  # ... 恢复所有通用寄存器 ...
+**场景 1：用户传递内核空间地址**
+
+```c
+// vm.c - walkaddr 中的检查
+uint64 walkaddr(pagetable_t pagetable, uint64 va)
+{
+  // 关键安全检查：地址不能超过 MAXVA
+  // MAXVA = (1L << (9 + 9 + 9 + 12 - 1)) = 0x4000000000
+  // 内核空间从 KERNBASE (0x80000000) 开始
+  if(va >= MAXVA)
+    return 0;  // 拒绝访问
   
-  ld a0, 112(a0)    # 恢复 a0(系统调用返回值)
+  pte_t *pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return 0;
+  if((*pte & PTE_V) == 0)
+    return 0;
   
-  sret              # 返回用户态,pc = trapframe->epc
+  // 关键检查：页面必须有 PTE_U 标志（用户可访问）
+  // 内核页面没有这个标志
+  if((*pte & PTE_U) == 0)
+    return 0;
+  
+  return PTE2PA(*pte);
+}
 ```
 
-至此,进程完成了"从不存在 -> 内核态 -> 用户态"的完整转换。
+**为什么 PTE_U 检查能防护内核地址？**
 
-#### 逻辑总结
+在 `kvminit()` 中，内核映射内核页面时**不设置 PTE_U 位**：
 
-**为什么这种"伪造"能成功?**
+```c
+// vm.c
+void kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+{
+  // 注意：这里没有 PTE_U
+  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
+    panic("kvmmap");
+}
+```
 
-因为操作系统的上下文切换机制是**对称的**:它只关心寄存器值,不关心这些值从哪里来。通过人为设置 `ra` 和 `sp`,我们欺骗了 `swtch`,让它以为这个进程"曾经"在 `forkret` 中被中断,现在要恢复它。
+而用户页面映射时会设置 PTE_U：
 
-这种技巧在操作系统中被称为 **"Trampoline"**(蹦床),因为它让执行流"跳跃"到一个新的起点,绕过了正常的函数调用路径。
+```c
+// vm.c - uvmalloc
+if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0)
+```
+
+**场景 2：用户传递未映射的地址**
+
+```c
+// copyin/copyout 的防护
+int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+{
+  while(len > 0){
+    va0 = PGROUNDDOWN(srcva);
+    pa0 = walkaddr(pagetable, va0);
+    
+    // 如果地址未在用户页表中映射，walkaddr 返回 0
+    if(pa0 == 0)
+      return -1;  // 安全拒绝，返回错误而非崩溃
+    
+    // ...
+  }
+  return 0;
+}
+```
+
+### 4.2 文件描述符边界检查
+
+```c
+// sysfile.c - argfd 的完整检查
+static int argfd(int n, int *pfd, struct file **pf)
+{
+  int fd;
+  struct file *f;
+
+  argint(n, &fd);
+  
+  // 检查 1：负数文件描述符
+  if(fd < 0)
+    return -1;
+  
+  // 检查 2：超过最大值 (NOFILE = 16)
+  if(fd >= NOFILE)
+    return -1;
+  
+  // 检查 3：该 fd 槽位是否有有效的 file 结构
+  if((f = myproc()->ofile[fd]) == 0)
+    return -1;
+  
+  if(pfd)
+    *pfd = fd;
+  if(pf)
+    *pf = f;
+  return 0;
+}
+```
+
+**实际应用示例：**
+
+```c
+uint64 sys_read(void)
+{
+  struct file *f;
+  int n;
+  uint64 p;
+
+  argaddr(1, &p);
+  argint(2, &n);
+  
+  // 如果 argfd 返回 -1，整个系统调用返回 -1
+  if(argfd(0, 0, &f) < 0)
+    return -1;
+  
+  return fileread(f, p, n);
+}
+
+uint64 sys_close(void)
+{
+  int fd;
+  struct file *f;
+
+  // 不仅验证，还获取 fd 值用于清空 ofile 槽位
+  if(argfd(0, &fd, &f) < 0)
+    return -1;
+  
+  myproc()->ofile[fd] = 0;  // 安全清空
+  fileclose(f);
+  return 0;
+}
+```
+
+### 4.3 系统调用号验证
+
+```c
+// syscall.c
+void syscall(void)
+{
+  int num;
+  struct proc *p = myproc();
+
+  num = p->trapframe->a7;
+  
+  // 三重验证：
+  // 1. num > 0: 排除非法的 0 和负数
+  // 2. num < NELEM(syscalls): 不超过数组边界
+  // 3. syscalls[num] != 0: 该位置有有效函数指针
+  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+    p->trapframe->a0 = syscalls[num]();
+  } else {
+    printf("%d %s: unknown sys call %d\n",
+            p->pid, p->name, num);
+    p->trapframe->a0 = -1;  // 返回错误码
+  }
+}
+```
+
+### 4.4 字符串长度限制
+
+```c
+// sysfile.c - sys_exec 中的路径长度检查
+uint64 sys_exec(void)
+{
+  char path[MAXPATH];  // MAXPATH = 128
+  // ...
+
+  // fetchstr 内部使用 copyinstr，最多复制 MAXPATH 字节
+  if(argstr(0, path, MAXPATH) < 0) {
+    // ...
+    return -1;
+  }
+  // ...
+}
+
+// syscall.c
+int argstr(int n, char *buf, int max)
+{
+  uint64 addr;
+  argaddr(n, &addr);
+  return fetchstr(addr, buf, max);  // max 限制拷贝长度
+}
+```
+
+**copyinstr 的终止检测：**
+
+```c
+int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+{
+  // ...
+  int got_null = 0;
+
+  while(got_null == 0 && max > 0){
+    // ...
+    while(n > 0){
+      if(*p == '\0'){
+        *dst = '\0';
+        got_null = 1;
+        break;
+      }
+      // ...
+      --max;  // 递减剩余可拷贝字节数
+    }
+  }
+  
+  if(got_null){
+    return 0;
+  } else {
+    return -1;  // 未找到终止符，字符串过长
+  }
+}
+```
 
 ---
 
-## 四、总结与反思
+## 总结
 
-本实验的进程管理与调度机制展现了操作系统设计的三个核心原则:
+### 设计原则
 
-1. **抽象与封装**:通过 `struct proc` 和 `struct context`,将进程的复杂状态封装成可管理的数据结构。
-2. **不变式(Invariant)保护**:通过锁机制,保证并发环境下的状态一致性(如"一个进程同一时刻只能被一个CPU运行")。
-3. **对称性设计**:`swtch` 的对称性使得正常切换和首次调度可以用统一的机制处理。
+| 方面 | 实现策略 | 目的 |
+|------|----------|------|
+| **地址空间隔离** | Trampoline 双重映射 | 页表切换时代码连续性 |
+| **参数传递** | 通过 Trapframe 读取 a0-a5 | 标准化接口 |
+| **内存安全** | walkaddr + PTE_U 检查 | 防止内核内存泄露 |
+| **边界检查** | argfd 多重验证 | 防止数组越界 |
+| **错误处理** | 统一返回 -1 | 用户态可感知错误 |
 
-本报告通过逐层剖析 `fork-exec-schedule-exit-wait` 的完整链路,揭示了看似简单的系统调用背后隐藏的深刻设计哲学。每一个锁的获取顺序、每一个寄存器的保存时机,都经过精心设计,以避免竞态条件和死锁。理解这些细节,是掌握操作系统内核开发的关键。
+### 关键寄存器角色
+
+| 寄存器 | 用途 |
+|--------|------|
+| `a0-a5` | 系统调用参数 |
+| `a7` | 系统调用号 |
+| `a0` | 返回值 |
+| `sepc` | 保存/恢复用户 PC |
+| `scause` | 陷入原因 (8 = 用户态 ecall) |
+| `stvec` | 陷阱处理入口地址 |
+| `satp` | 页表基址 |
+| `sscratch` | 临时寄存器保存 |
 
 找到具有 1 个许可证类型的类似代码

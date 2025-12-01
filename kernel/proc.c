@@ -8,7 +8,6 @@
 
 struct cpu cpu;
 
-// finite process table
 struct proc proc[NPROC];
 
 struct proc *initproc;
