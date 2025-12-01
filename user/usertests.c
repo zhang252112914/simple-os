@@ -12,6 +12,7 @@
 
 // Pipe-based producer/consumer to validate basic IPC.
 int pcpipe[2];
+static char large_chunk[512];
 
 void producer_task(void) {
   // Only writing.
@@ -201,6 +202,58 @@ void test_security(void) {
   close(p[0]);
 }
 
+void test_crash_recovery(void) {
+  printf("Testing crash recovery...\n");
+
+  const char *fname = "crash_recovery_file";
+  unlink(fname);
+
+  int fd = open(fname, O_CREATE | O_RDWR);
+  assert(fd >= 0);
+  const char *initial = "initial\n";
+  assert(write(fd, initial, strlen(initial)) == strlen(initial));
+  close(fd);
+
+  int pid = fork();
+  if (pid == 0) {
+    int cfd = open(fname, O_RDWR);
+    if (cfd >= 0) {
+      const char *during = "during_crash\n";
+      write(cfd, during, strlen(during));
+    }
+    // Simulate a crash mid-update.
+    volatile int *bad = (int *)0;
+    *bad = 1;
+    exit(1);
+  } else if (pid > 0) {
+    int status = 0;
+    int wpid = wait(&status);
+    assert(wpid == pid);
+    assert(status != 0);
+
+    // Ensure the file system still accepts writes/reads.
+    fd = open(fname, O_RDWR);
+    assert(fd >= 0);
+    const char *after = "after_recovery\n";
+    assert(write(fd, after, strlen(after)) == strlen(after));
+    close(fd);
+
+    fd = open(fname, O_RDONLY);
+    assert(fd >= 0);
+    char buf[32];
+    int n = read(fd, buf, sizeof(buf));
+    assert(n >= (int)strlen(after));
+    buf[strlen(after)] = 0;
+    assert(memcmp(buf, after, strlen(after)) == 0);
+    close(fd);
+
+    unlink(fname);
+  } else {
+    printf("fork failed in test_crash_recovery\n");
+  }
+  printf("Crash recovery test completed\n");
+}
+
 void test_syscall_performance(void) {
   uint64 start = uptime();
   for (int i = 0; i < 10000; i++) {
@@ -211,6 +264,103 @@ void test_syscall_performance(void) {
   printf("10000 getpid() calls took %lu cycles\n", end - start);
 }
 
+void test_filesystem_integrity(void) {
+  printf("Testing filesystem integrity...\n");
+  int fd = open("testfile", O_CREATE | O_RDWR);
+  assert(fd >= 0);
+
+  char buffer[] = "Hello, filesystem!\n";
+  int bytes = write(fd, buffer, strlen(buffer));
+  assert(bytes == strlen(buffer));
+  close(fd);
+
+  fd = open("testfile", O_RDONLY);
+  assert(fd >= 0);
+
+  char read_buffer[32];
+  bytes = read(fd, read_buffer, sizeof(read_buffer));
+  read_buffer[bytes] = '\0';
+  assert(strcmp(buffer, read_buffer) == 0);
+  close(fd);
+
+  assert(unlink("testfile") == 0);
+  printf("Filesystem integrity test completed\n");
+}
+
+void test_concurrent_access(void) {
+  printf("Testing concurrent file access...\n");
+
+  for (int i = 0; i < 4; i++) {
+    if (fork() == 0) {
+      char filename[32];
+      snprintf(filename, sizeof(filename), "test_%d", i);
+
+      for (int j = 0; j < 100; j++) {
+        int fd = open(filename, O_CREATE | O_RDWR);
+        if (fd < 0) {
+          printf("Process %d: Failed to open %s\n", i, filename);
+          exit(1);
+        }
+
+        write(fd, &j, sizeof(j));
+        close(fd);
+        unlink(filename);
+      }
+      exit(0);
+    }
+  }
+
+  for (int i = 0; i < 4; i++) {
+    wait(0);
+  }
+
+  printf("Concurrent file access test completed\n");
+}
+
+void test_filesystem_performance(void) {
+  printf("Testing filesystem performance...\n");
+  uint64 start = uptime();
+
+  for (int i = 0; i < 100; i++) {
+    char filename[32];
+    snprintf(filename, sizeof(filename), "small_%d", i);
+
+    int fd = open(filename, O_CREATE | O_RDWR);
+    if (fd < 0) {
+      printf("Failed to create %s\n", filename);
+      continue;
+    }
+
+    write(fd, "small_file_thirty_two_byte_write", 32);
+    close(fd);
+  }
+
+  uint64 small_files_time = uptime() - start;
+
+  start = uptime();
+  int fd = open("largefile", O_CREATE | O_RDWR);
+  if (fd < 0) {
+    printf("Failed to create largefile\n");
+  } else {
+    // Avoid blowing the small user stack: use a modest static chunk.
+    for (int i = 0; i < (4096 * 1024) / sizeof(large_chunk); i++) {
+      write(fd, large_chunk, sizeof(large_chunk));
+    }
+    close(fd);
+  }
+
+  uint64 large_file_time = uptime() - start;
+  printf("Small files (100x32B): %lu cycles\n", small_files_time);
+  printf("Large file (4MB): %lu cycles\n", large_file_time);
+
+  for (int i = 0; i < 100; i++) {
+    char filename[32];
+    snprintf(filename, sizeof(filename), "small_%d", i);
+    unlink(filename);
+  }
+  unlink("largefile");
+}
+
 int main(int argc, char *argv[]) {
   test_process_creation();
   test_scheduler();
@@ -218,7 +368,11 @@ int main(int argc, char *argv[]) {
   test_basic_syscalls();
   test_parameter_passing();
   test_security();
+  test_crash_recovery();
   test_syscall_performance();
+  test_filesystem_integrity();
+  test_concurrent_access();
+  test_filesystem_performance();
   printf("All user tests passed\n");
   exit(0);
 }

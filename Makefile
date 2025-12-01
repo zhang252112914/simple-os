@@ -29,6 +29,7 @@ OBJS = \
   $K/syscall.o \
   $K/sysfile.o \
   $K/sysproc.o \
+  $K/kerneltest.o \
   $K/main.o
 
 # Try to infer the correct TOOLPREFIX if not set

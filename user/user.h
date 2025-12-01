@@ -47,6 +47,8 @@ char *sbrklazy(int);
 // printf.c
 void fprintf(int, const char *, ...) __attribute__((format(printf, 2, 3)));
 void printf(const char *, ...) __attribute__((format(printf, 1, 2)));
+int snprintf(char *, int, const char *, ...)
+    __attribute__((format(printf, 3, 4)));
 
 // umalloc.c
 void *malloc(uint);

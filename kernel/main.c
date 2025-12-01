@@ -19,6 +19,7 @@ void main() {
   iinit();            // inode table
   fileinit();         // file table
   virtio_disk_init(); // emulated hard disk
+  kerneltest();       // run kernel tests
   userinit();         // first user process
   scheduler();
 }
