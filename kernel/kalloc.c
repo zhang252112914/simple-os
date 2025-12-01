@@ -13,6 +13,11 @@ void freerange(void *pa_start, void *pa_end);
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
+int page_refcount[(PHYSTOP - KERNBASE) >> 12];
+
+// lock to protect the page_refcount array
+struct spinlock pageref_lock;
+
 struct run {
   struct run *next;
 };
@@ -24,6 +29,7 @@ struct {
 
 void kinit() {
   initlock(&kmem.lock, "kmem");
+  initlock(&pageref_lock, "pageref");
   freerange(end, (void *)PHYSTOP);
 }
 
@@ -44,15 +50,17 @@ void kfree(void *pa) {
   if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
+  acquire(&pageref_lock);
+  if (--page_refcount[REF_INDEX(pa)] <= 0) {
+    memset(pa, 1, PGSIZE);
 
-  r = (struct run *)pa;
-
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+    r = (struct run *)pa;
+    acquire(&kmem.lock);
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+    release(&kmem.lock);
+  }
+  release(&pageref_lock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -67,7 +75,38 @@ void *kalloc(void) {
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if (r)
+  if (r) {
     memset((char *)r, 5, PGSIZE); // fill with junk
+    page_refcount[REF_INDEX(r)] = 1;
+  }
   return (void *)r;
+}
+
+void *kcowalloc(void *pa) {
+  acquire(&pageref_lock);
+
+  if (page_refcount[REF_INDEX(pa)] <= 1) {
+    release(&pageref_lock);
+    return pa; // only one reference, no need to copy
+  }
+
+  void *new_pa = kalloc();
+  if (new_pa == 0) {
+    release(&pageref_lock);
+    return 0; // allocation failed
+  }
+
+  memmove(new_pa, pa, PGSIZE);
+
+  page_refcount[REF_INDEX(pa)]--;
+
+  release(&pageref_lock);
+
+  return new_pa;
+}
+
+void kref(void *pa) {
+  acquire(&pageref_lock);
+  page_refcount[REF_INDEX(pa)]++;
+  release(&pageref_lock);
 }

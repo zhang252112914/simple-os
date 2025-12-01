@@ -57,6 +57,9 @@ uint64 usertrap(void) {
     syscall();
   } else if ((which_dev = devintr()) != 0) {
     // ok
+  } else if (r_scause() == 15 && uvmcheckcow(p->pagetable, r_stval())) {
+    if (uvmcowcopy(p->pagetable, r_stval()) < 0)
+      setkilled(p);
   } else if ((r_scause() == 15 || r_scause() == 13) &&
              vmfault(p->pagetable, r_stval(), (r_scause() == 13) ? 1 : 0) !=
                  0) {

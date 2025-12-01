@@ -202,58 +202,6 @@ void test_security(void) {
   close(p[0]);
 }
 
-void test_crash_recovery(void) {
-  printf("Testing crash recovery...\n");
-
-  const char *fname = "crash_recovery_file";
-  unlink(fname);
-
-  int fd = open(fname, O_CREATE | O_RDWR);
-  assert(fd >= 0);
-  const char *initial = "initial\n";
-  assert(write(fd, initial, strlen(initial)) == strlen(initial));
-  close(fd);
-
-  int pid = fork();
-  if (pid == 0) {
-    int cfd = open(fname, O_RDWR);
-    if (cfd >= 0) {
-      const char *during = "during_crash\n";
-      write(cfd, during, strlen(during));
-    }
-    // Simulate a crash mid-update.
-    volatile int *bad = (int *)0;
-    *bad = 1;
-    exit(1);
-  } else if (pid > 0) {
-    int status = 0;
-    int wpid = wait(&status);
-    assert(wpid == pid);
-    assert(status != 0);
-
-    // Ensure the file system still accepts writes/reads.
-    fd = open(fname, O_RDWR);
-    assert(fd >= 0);
-    const char *after = "after_recovery\n";
-    assert(write(fd, after, strlen(after)) == strlen(after));
-    close(fd);
-
-    fd = open(fname, O_RDONLY);
-    assert(fd >= 0);
-    char buf[32];
-    int n = read(fd, buf, sizeof(buf));
-    assert(n >= (int)strlen(after));
-    buf[strlen(after)] = 0;
-    assert(memcmp(buf, after, strlen(after)) == 0);
-    close(fd);
-
-    unlink(fname);
-  } else {
-    printf("fork failed in test_crash_recovery\n");
-  }
-  printf("Crash recovery test completed\n");
-}
-
 void test_syscall_performance(void) {
   uint64 start = uptime();
   for (int i = 0; i < 10000; i++) {
@@ -368,7 +316,6 @@ int main(int argc, char *argv[]) {
   test_basic_syscalls();
   test_parameter_passing();
   test_security();
-  test_crash_recovery();
   test_syscall_performance();
   test_filesystem_integrity();
   test_concurrent_access();

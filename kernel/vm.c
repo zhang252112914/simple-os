@@ -267,28 +267,66 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz) {
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  int cow = 0;
 
   for (i = 0; i < sz; i += PGSIZE) {
     if ((pte = walk(old, i, 0)) == 0)
       continue; // page table entry hasn't been allocated
     if ((*pte & PTE_V) == 0)
       continue; // physical page hasn't been allocated
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if ((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char *)pa, PGSIZE);
-    if (mappages(new, i, PGSIZE, (uint64)mem, flags) != 0) {
-      kfree(mem);
-      goto err;
+    if (flags & PTE_W) {
+      flags = (flags & ~PTE_W) | PTE_C; // clear write, set copy-on-write
+      *pte = PA2PTE(pa) | flags;
+      cow = 1;
     }
+
+    if (mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
+    kref((void *)pa);
   }
+  if (cow)
+    sfence_vma();
   return 0;
 
 err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
+}
+
+int uvmcheckcow(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+
+  return va < MAXVA && (pte = walk(pagetable, va, 0)) != 0 && (*pte & PTE_V) &&
+         (*pte & PTE_C);
+}
+
+int uvmcowcopy(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+  uint64 mem, pa;
+  uint flags;
+
+  va = PGROUNDDOWN(va);
+
+  if ((pte = walk(pagetable, va, 0)) == 0)
+    panic("uvmcowcopy: pte should exist");
+
+  pa = PTE2PA(*pte);
+  flags = (PTE_FLAGS(*pte) | PTE_W) & ~PTE_C;
+
+  if ((mem = (uint64)kcowalloc((void *)pa)) == 0)
+    return -1;
+
+  uvmunmap(pagetable, va, 1, 0);
+
+  if (mappages(pagetable, va, PGSIZE, (uint64)mem, flags) != 0)
+    panic("uvmcowcopy: mappages");
+
+  sfence_vma();
+
+  return 0;
 }
 
 // mark a PTE invalid for user access.
@@ -310,6 +348,10 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
   pte_t *pte;
 
   while (len > 0) {
+    if (uvmcheckcow(pagetable, dstva)) {
+      if (uvmcowcopy(pagetable, dstva) < 0)
+        return -1;
+    }
     va0 = PGROUNDDOWN(dstva);
     if (va0 >= MAXVA)
       return -1;
